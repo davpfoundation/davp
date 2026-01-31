@@ -1,0 +1,121 @@
+use anyhow::Result;
+use clap::Parser;
+use crossterm::event::{self, Event, KeyCode};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::ExecutableCommand;
+use davp_bootstrap_server::start_server_with_shutdown;
+use ratatui::prelude::*;
+use ratatui::widgets::{Block, Borders, Cell, Row, Table};
+use std::io::{stdout, Stdout};
+use std::net::SocketAddr;
+use std::time::Duration;
+use tokio::sync::watch;
+
+#[derive(Parser, Debug)]
+#[command(name = "davp_bootstrap_server")]
+struct Cli {
+    #[arg(long, default_value = "0.0.0.0:9100")]
+    bind: SocketAddr,
+
+    #[arg(long, default_value_t = 5)]
+    ttl_seconds: i64,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let server = start_server_with_shutdown(cli.bind, cli.ttl_seconds, shutdown_rx).await?;
+
+    enable_raw_mode()?;
+    stdout().execute(EnterAlternateScreen)?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+
+    let res = run_tui(&mut terminal, cli.bind, cli.ttl_seconds, server).await;
+
+    let _ = shutdown_tx.send(true);
+
+    disable_raw_mode()?;
+    stdout().execute(LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    res
+}
+
+async fn run_tui(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    bind: SocketAddr,
+    ttl_seconds: i64,
+    server: davp_bootstrap_server::CntServerHandle,
+) -> Result<()> {
+    loop {
+        if event::poll(Duration::from_millis(50))? {
+            if let Event::Key(k) = event::read()? {
+                if k.code == KeyCode::Char('q') {
+                    break;
+                }
+            }
+        }
+
+        let entries = server.entries().await;
+        let now = chrono::Utc::now();
+
+        terminal.draw(|f| {
+            let area = f.area();
+            let block = Block::default()
+                .title(format!(
+                    "DAVP CNT (Tracker) | bind={} | ttl={}s | q=quit",
+                    bind,
+                    ttl_seconds.max(5)
+                ))
+                .borders(Borders::ALL);
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+
+            let header = Row::new(vec![
+                Cell::from("addr"),
+                Cell::from("expires_in_ms"),
+                Cell::from("connected"),
+                Cell::from("known"),
+                Cell::from("last_seen"),
+            ])
+            .style(Style::default().add_modifier(Modifier::BOLD));
+
+            let rows = entries.iter().map(|e| {
+                let expires_ms = (e.expires_at - now).num_milliseconds().max(0);
+                Row::new(vec![
+                    Cell::from(e.addr.to_string()),
+                    Cell::from(expires_ms.to_string()),
+                    Cell::from(e.connected_peers.len().to_string()),
+                    Cell::from(e.known_peers.len().to_string()),
+                    Cell::from(e.last_seen.to_rfc3339()),
+                ])
+            });
+
+            let table = Table::new(
+                rows,
+                [
+                    Constraint::Length(22),
+                    Constraint::Length(14),
+                    Constraint::Length(10),
+                    Constraint::Length(10),
+                    Constraint::Min(20),
+                ],
+            )
+            .header(header)
+            .block(Block::default().borders(Borders::ALL).title("Active peers"));
+
+            f.render_widget(table, inner);
+        })?;
+
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                break;
+            }
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+    }
+
+    Ok(())
+}
