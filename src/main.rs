@@ -169,7 +169,7 @@ async fn main() -> Result<()> {
                 let peer_graph_for_task = Arc::clone(&peer_graph);
                 tokio::spawn(async move {
                     let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
-                    let mut cnt_report_tick = tokio::time::interval(std::time::Duration::from_secs(5));
+                    let mut cnt_report_tick = tokio::time::interval(std::time::Duration::from_secs(2));
                     loop {
                         tokio::select! {
                             _ = tick.tick() => {

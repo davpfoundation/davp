@@ -43,9 +43,6 @@ struct DavpApp {
     peers: String,
 
     cnt_server: String,
-    start_cnt_server: bool,
-    cnt_bind: String,
-    cnt_ttl_seconds: i64,
     cnt_enabled: bool,
 
     node_bind: String,
@@ -56,13 +53,10 @@ struct DavpApp {
 
     peers_arc: Arc<RwLock<Vec<SocketAddr>>>,
     peer_graph: Arc<RwLock<HashMap<SocketAddr, Vec<SocketAddr>>>>,
-    bootstrap_entries: Arc<Mutex<Vec<PeerEntry>>>,
-    reachable_peers: Arc<Mutex<Vec<SocketAddr>>>,
-    tasks_started: bool,
 
     node_shutdown_tx: Option<watch::Sender<bool>>,
+    node_handle: Option<tokio::task::JoinHandle<()>>,
     sync_shutdown_tx: Option<watch::Sender<bool>>,
-    cnt_server_shutdown_tx: Option<watch::Sender<bool>>,
     cnt_enabled_tx: Option<watch::Sender<bool>>,
 
     rt: tokio::runtime::Runtime,
@@ -100,10 +94,7 @@ impl Default for DavpApp {
             storage_dir: "davp_storage".to_string(),
             peers: "".to_string(),
             cnt_server: "127.0.0.1:9100".to_string(),
-            start_cnt_server: true,
-            cnt_bind: "127.0.0.1:9100".to_string(),
-            cnt_ttl_seconds: 5,
-            cnt_enabled: true,
+            cnt_enabled: false,
             node_bind: "127.0.0.1:9002".to_string(),
             max_peers: 10,
             run_node_enabled: true,
@@ -208,22 +199,9 @@ impl eframe::App for DavpApp {
                             ui.checkbox(&mut self.run_node_enabled, "Run node");
                         });
 
-                        ui.horizontal(|ui| {
-                            ui.label("CNT server (tracker):");
-                            ui.text_edit_singleline(&mut self.cnt_server);
-                        });
+                        ui.label(format!("CNT tracker: {}", self.cnt_server));
 
-                        ui.horizontal(|ui| {
-                            ui.label("Local CNT server:");
-                            ui.label("Bind:");
-                            ui.text_edit_singleline(&mut self.cnt_bind);
-                            ui.label("TTL (s):");
-                            ui.add(egui::DragValue::new(&mut self.cnt_ttl_seconds).clamp_range(5..=600));
-                        });
 
-                        ui.horizontal(|ui| {
-                            ui.checkbox(&mut self.cnt_enabled, "Use CNT tracker (optional)");
-                        });
 
                         ui.horizontal(|ui| {
                             ui.label("Manual seed peers (comma host:port):");
@@ -514,19 +492,12 @@ impl DavpApp {
         if let Some(tx) = self.sync_shutdown_tx.take() {
             let _ = tx.send(true);
         }
-        if let Some(tx) = self.node_shutdown_tx.take() {
-            let _ = tx.send(true);
+        if let Some(node_handle) = self.node_handle.take() {
+            if let Some(tx) = self.node_shutdown_tx.take() {
+                let _ = tx.send(true);
+            }
+            let _ = self.rt.block_on(async { node_handle.await });
         }
-
-        if let Some(tx) = self.cnt_enabled_tx.take() {
-            let _ = tx.send(false);
-        }
-
-        if let Some(tx) = self.cnt_server_shutdown_tx.take() {
-            let _ = tx.send(true);
-        }
-
-        self.tasks_started = false;
         self.networking_started = false;
 
         if let Ok(mut g) = self.bootstrap_entries.lock() {
@@ -555,20 +526,6 @@ impl DavpApp {
         let peer_graph = Arc::clone(&self.peer_graph);
         let bootstrap_entries = Arc::clone(&self.bootstrap_entries);
         let reachable_peers = Arc::clone(&self.reachable_peers);
-
-        if self.start_cnt_server {
-            let cnt_bind: SocketAddr = match self.cnt_bind.parse() {
-                Ok(v) => v,
-                Err(_) => return,
-            };
-            let ttl = self.cnt_ttl_seconds;
-
-            let (cnt_server_shutdown_tx, cnt_server_shutdown_rx) = watch::channel(false);
-            self.cnt_server_shutdown_tx = Some(cnt_server_shutdown_tx);
-            self.rt.spawn(async move {
-                let _ = run_server_with_shutdown(cnt_bind, ttl, cnt_server_shutdown_rx).await;
-            });
-        }
 
         let cnt_server: SocketAddr = match self.cnt_server.parse() {
             Ok(v) => v,
@@ -614,7 +571,7 @@ impl DavpApp {
             .await;
 
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
-            let mut cnt_report_tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            let mut cnt_report_tick = tokio::time::interval(std::time::Duration::from_secs(2));
             loop {
                 if *sync_shutdown_rx.borrow() {
                     break;
@@ -628,42 +585,9 @@ impl DavpApp {
                         let cnt_enabled = *cnt_enabled_rx.borrow();
                         let _ = sync_network_once(
                             bind,
-                            max_peers,
-                            Arc::clone(&peers_arc),
-                            Arc::clone(&peer_graph),
-                            cnt_server,
-                            Arc::clone(&bootstrap_entries),
-                            Arc::clone(&reachable_peers),
-                            cnt_enabled,
-                            false, // skip_cnt_report
-                        )
-                        .await;
-                    }
-                    _ = cnt_report_tick.tick() => {
-                        let cnt_enabled = *cnt_enabled_rx.borrow();
-                        if cnt_enabled {
-                            let _ = sync_network_once(
-                                bind,
-                                max_peers,
-                                Arc::clone(&peers_arc),
-                                Arc::clone(&peer_graph),
-                                cnt_server,
-                                Arc::clone(&bootstrap_entries),
-                                Arc::clone(&reachable_peers),
-                                cnt_enabled,
-                                true, // cnt_report_only
-                            )
-                            .await;
-                        }
-                    }
-                }
             }
-        });
-
-        self.tasks_started = true;
-    }
-
-    fn ui_keygen(&mut self, ui: &mut egui::Ui) {
+            if !peers.contains(&p) {
+                peers.push(p);
         ui.heading("Keygen");
         ui.add_space(8.0);
 
