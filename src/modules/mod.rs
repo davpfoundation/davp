@@ -1,6 +1,7 @@
 pub mod api;
 pub mod asset;
 pub mod bootstrap;
+pub mod certification;
 pub mod hash;
 pub mod metadata;
 pub mod network;

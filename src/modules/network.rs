@@ -1,4 +1,5 @@
 use crate::modules::asset::Proof;
+use crate::modules::certification::{IssuerCertificate, PublishedProof};
 use crate::modules::hash::AssetHash;
 use crate::modules::storage::Storage;
 use crate::modules::verification::verify_proof;
@@ -20,6 +21,30 @@ pub struct NodeConfig {
     pub peer_graph: Arc<RwLock<HashMap<SocketAddr, Vec<SocketAddr>>>>,
 }
 
+pub async fn fetch_published_proof_from_peers(
+    peers: &[SocketAddr],
+    verification_id: &str,
+) -> Result<Option<PublishedProof>> {
+    for peer in peers {
+        if let Ok(Some(published)) = request_published_proof(*peer, verification_id).await {
+            return Ok(Some(published));
+        }
+    }
+    Ok(None)
+}
+
+pub async fn fetch_issuer_certificate_from_peers(
+    peers: &[SocketAddr],
+    certificate_id: &str,
+) -> Result<Option<IssuerCertificate>> {
+    for peer in peers {
+        if let Ok(Some(cert)) = request_issuer_certificate(*peer, certificate_id).await {
+            return Ok(Some(cert));
+        }
+    }
+    Ok(None)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerConnections {
     pub addr: SocketAddr,
@@ -29,8 +54,14 @@ pub struct PeerConnections {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Message {
     PushProof(Proof),
+    PushPublishedProof(PublishedProof),
+    PushIssuerCertificate(IssuerCertificate),
     GetProof { verification_id: String },
     ProofResponse { proof: Option<Proof> },
+    GetPublishedProof { verification_id: String },
+    PublishedProofResponse { published: Option<PublishedProof> },
+    GetIssuerCertificate { certificate_id: String },
+    IssuerCertificateResponse { cert: Option<IssuerCertificate> },
     GetIdsByHash { asset_hash: AssetHash },
     IdsByHashResponse { verification_ids: Vec<String> },
     Ping { from: SocketAddr, known_peers: Vec<SocketAddr>, connections: Vec<PeerConnections> },
@@ -52,6 +83,38 @@ pub async fn run_node(storage: Storage, config: NodeConfig) -> Result<()> {
         tokio::spawn(async move {
             let _ = handle_connection(stream, storage, peers, peer_graph).await;
         });
+    }
+}
+
+async fn request_published_proof(peer: SocketAddr, verification_id: &str) -> Result<Option<PublishedProof>> {
+    let mut stream = timeout(Duration::from_millis(200), TcpStream::connect(peer)).await??;
+    write_message(
+        &mut stream,
+        &Message::GetPublishedProof {
+            verification_id: verification_id.to_string(),
+        },
+    )
+    .await?;
+
+    match read_message(&mut stream).await? {
+        Message::PublishedProofResponse { published } => Ok(published),
+        _ => Ok(None),
+    }
+}
+
+async fn request_issuer_certificate(peer: SocketAddr, certificate_id: &str) -> Result<Option<IssuerCertificate>> {
+    let mut stream = timeout(Duration::from_millis(200), TcpStream::connect(peer)).await??;
+    write_message(
+        &mut stream,
+        &Message::GetIssuerCertificate {
+            certificate_id: certificate_id.to_string(),
+        },
+    )
+    .await?;
+
+    match read_message(&mut stream).await? {
+        Message::IssuerCertificateResponse { cert } => Ok(cert),
+        _ => Ok(None),
     }
 }
 
@@ -96,6 +159,21 @@ pub async fn replicate_proof(proof: &Proof, peers: &[SocketAddr]) {
     }
 }
 
+pub async fn replicate_published_proof(published: &PublishedProof, peers: &[SocketAddr]) {
+    for peer in peers {
+        if published.issuer_certificate_id.is_some() {
+            let _ = send_message(*peer, &Message::PushPublishedProof(published.clone())).await;
+        }
+        let _ = send_message(*peer, &Message::PushProof(published.proof.clone())).await;
+    }
+}
+
+pub async fn replicate_issuer_certificate(cert: &IssuerCertificate, peers: &[SocketAddr]) {
+    for peer in peers {
+        let _ = send_message(*peer, &Message::PushIssuerCertificate(cert.clone())).await;
+    }
+}
+
 async fn handle_connection(
     mut stream: TcpStream,
     storage: Arc<Storage>,
@@ -113,6 +191,17 @@ async fn handle_connection(
                 replicate_proof(&proof, &peers_snapshot).await;
             }
         }
+        Message::PushPublishedProof(published) => {
+            verify_proof(&published.proof, None)?;
+            if !storage.contains(&published.proof.verification_id) {
+                storage.store_published_proof(&published)?;
+                let peers_snapshot = peers.read().await.clone();
+                replicate_published_proof(&published, &peers_snapshot).await;
+            }
+        }
+        Message::PushIssuerCertificate(cert) => {
+            let _ = storage.store_issuer_certificate(&cert);
+        }
         Message::GetProof { verification_id } => {
             let proof = if storage.contains(&verification_id) {
                 Some(storage.retrieve_proof(&verification_id)?)
@@ -120,6 +209,30 @@ async fn handle_connection(
                 None
             };
             write_message(&mut stream, &Message::ProofResponse { proof }).await?;
+        }
+        Message::GetPublishedProof { verification_id } => {
+            let published = if storage.contains(&verification_id) {
+                Some(storage.retrieve_published_proof(&verification_id)?)
+            } else {
+                None
+            };
+            write_message(
+                &mut stream,
+                &Message::PublishedProofResponse { published },
+            )
+            .await?;
+        }
+        Message::GetIssuerCertificate { certificate_id } => {
+            let cert = if storage.has_issuer_certificate(&certificate_id) {
+                Some(storage.retrieve_issuer_certificate(&certificate_id)?)
+            } else {
+                None
+            };
+            write_message(
+                &mut stream,
+                &Message::IssuerCertificateResponse { cert },
+            )
+            .await?;
         }
         Message::GetIdsByHash { asset_hash } => {
             let verification_ids = storage.lookup_by_hash(&asset_hash).unwrap_or_default();
@@ -145,7 +258,10 @@ async fn handle_connection(
             )
             .await?;
         }
-        Message::ProofResponse { .. } | Message::IdsByHashResponse { .. } => {}
+        Message::ProofResponse { .. }
+        | Message::PublishedProofResponse { .. }
+        | Message::IssuerCertificateResponse { .. }
+        | Message::IdsByHashResponse { .. } => {}
         Message::Pong { .. } => {}
     }
 

@@ -1,11 +1,12 @@
 use anyhow::Result;
 use base64::Engine as _;
 use davp::modules::asset::create_proof_from_bytes;
+use davp::modules::certification::PublishedProof;
 use davp::modules::hash::blake3_hash_bytes;
 use davp::modules::bootstrap::{report_and_get_peers, PeerEntry, PeerReport};
 use davp::modules::metadata::{AssetType, Metadata};
 use davp::modules::network::{
-    fetch_ids_by_hash_from_peers, fetch_proof_from_peers, replicate_proof,
+    fetch_ids_by_hash_from_peers, fetch_proof_from_peers, replicate_published_proof, replicate_proof,
     run_node_with_shutdown, NodeConfig, PeerConnections, ping_peer,
 };
 use davp_bootstrap_server::run_server_with_shutdown;
@@ -54,9 +55,14 @@ struct DavpApp {
     peers_arc: Arc<RwLock<Vec<SocketAddr>>>,
     peer_graph: Arc<RwLock<HashMap<SocketAddr, Vec<SocketAddr>>>>,
 
+    bootstrap_entries: Arc<Mutex<Vec<PeerEntry>>>,
+    reachable_peers: Arc<Mutex<Vec<SocketAddr>>>,
+    tasks_started: bool,
+
     node_shutdown_tx: Option<watch::Sender<bool>>,
     node_handle: Option<tokio::task::JoinHandle<()>>,
     sync_shutdown_tx: Option<watch::Sender<bool>>,
+    cnt_server_shutdown_tx: Option<watch::Sender<bool>>,
     cnt_enabled_tx: Option<watch::Sender<bool>>,
 
     rt: tokio::runtime::Runtime,
@@ -72,6 +78,7 @@ struct DavpApp {
     create_description: String,
     create_tags: String,
     create_parent_verification_id: String,
+    create_issuer_certificate_id: String,
     created_verification_id: String,
 
     // verify
@@ -105,6 +112,7 @@ impl Default for DavpApp {
             reachable_peers: Arc::new(Mutex::new(Vec::new())),
             tasks_started: false,
             node_shutdown_tx: None,
+            node_handle: None,
             sync_shutdown_tx: None,
             cnt_server_shutdown_tx: None,
             cnt_enabled_tx: None,
@@ -122,6 +130,7 @@ impl Default for DavpApp {
             create_description: String::new(),
             create_tags: String::new(),
             create_parent_verification_id: String::new(),
+            create_issuer_certificate_id: String::new(),
             created_verification_id: String::new(),
 
             verify_verification_id: String::new(),
@@ -550,28 +559,17 @@ impl DavpApp {
                 peer_graph: Arc::clone(&peer_graph),
             };
 
-            self.rt.spawn(async move {
+            let node_handle = self.rt.spawn(async move {
                 let _ = run_node_with_shutdown(storage, config, node_shutdown_rx).await;
             });
+
+            self.node_handle = Some(node_handle);
         }
 
         self.rt.spawn(async move {
-            let cnt_enabled = *cnt_enabled_rx.borrow();
-            let _ = sync_network_once(
-                bind,
-                max_peers,
-                Arc::clone(&peers_arc),
-                Arc::clone(&peer_graph),
-                cnt_server,
-                Arc::clone(&bootstrap_entries),
-                Arc::clone(&reachable_peers),
-                cnt_enabled,
-                false, // cnt_report_only
-            )
-            .await;
-
             let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
             let mut cnt_report_tick = tokio::time::interval(std::time::Duration::from_secs(2));
+
             loop {
                 if *sync_shutdown_rx.borrow() {
                     break;
@@ -585,9 +583,40 @@ impl DavpApp {
                         let cnt_enabled = *cnt_enabled_rx.borrow();
                         let _ = sync_network_once(
                             bind,
+                            max_peers,
+                            Arc::clone(&peers_arc),
+                            Arc::clone(&peer_graph),
+                            cnt_server,
+                            Arc::clone(&bootstrap_entries),
+                            Arc::clone(&reachable_peers),
+                            cnt_enabled,
+                            false, // cnt_report_only
+                        )
+                        .await;
+                    }
+                    _ = cnt_report_tick.tick() => {
+                        let cnt_enabled = *cnt_enabled_rx.borrow();
+                        let _ = sync_network_once(
+                            bind,
+                            max_peers,
+                            Arc::clone(&peers_arc),
+                            Arc::clone(&peer_graph),
+                            cnt_server,
+                            Arc::clone(&bootstrap_entries),
+                            Arc::clone(&reachable_peers),
+                            cnt_enabled,
+                            true, // cnt_report_only
+                        )
+                        .await;
+                    }
+                }
             }
-            if !peers.contains(&p) {
-                peers.push(p);
+        });
+
+        self.tasks_started = true;
+    }
+
+    fn ui_keygen(&mut self, ui: &mut egui::Ui) {
         ui.heading("Keygen");
         ui.add_space(8.0);
 
@@ -638,6 +667,9 @@ impl DavpApp {
 
         ui.label("Parent verification_id (optional):");
         ui.text_edit_singleline(&mut self.create_parent_verification_id);
+
+        ui.label("Issuer certificate id (optional):");
+        ui.text_edit_singleline(&mut self.create_issuer_certificate_id);
 
         ui.add_space(8.0);
         ui.label("Keypair (base64):");
@@ -720,6 +752,12 @@ impl DavpApp {
             Some(self.create_parent_verification_id.trim().to_string())
         };
 
+        let issuer_certificate_id = if self.create_issuer_certificate_id.trim().is_empty() {
+            None
+        } else {
+            Some(self.create_issuer_certificate_id.trim().to_string())
+        };
+
         let metadata = Metadata::new(tags, description, parent_verification_id);
         let proof = create_proof_from_bytes(
             &bytes,
@@ -731,7 +769,11 @@ impl DavpApp {
         .map_err(|e| e.to_string())?;
 
         let storage = Storage::new(self.storage_dir.clone());
-        storage.store_proof(&proof).map_err(|e| e.to_string())?;
+        let published = PublishedProof {
+            proof: proof.clone(),
+            issuer_certificate_id,
+        };
+        storage.store_published_proof(&published).map_err(|e| e.to_string())?;
 
         let peers_arc = Arc::clone(&self.peers_arc);
         let peers = self
@@ -739,7 +781,13 @@ impl DavpApp {
             .block_on(async move { peers_arc.read().await.clone() });
         if !peers.is_empty() {
             self.rt
-                .block_on(async { replicate_proof(&proof, &peers).await });
+                .block_on(async {
+                    if published.issuer_certificate_id.is_some() {
+                        replicate_published_proof(&published, &peers).await;
+                    } else {
+                        replicate_proof(&proof, &peers).await;
+                    }
+                });
         }
 
         self.created_verification_id = proof.verification_id;

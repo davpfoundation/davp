@@ -3,8 +3,9 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::{Parser, Subcommand};
 use davp::modules::asset::create_proof_from_bytes;
 use davp::modules::bootstrap::{report_and_get_peers, PeerReport};
+use davp::modules::certification::PublishedProof;
 use davp::modules::metadata::{AssetType, Metadata};
-use davp::modules::network::{ping_peer, replicate_proof, run_node, NodeConfig, PeerConnections};
+use davp::modules::network::{ping_peer, replicate_published_proof, replicate_proof, run_node, NodeConfig, PeerConnections};
 use davp::modules::storage::Storage;
 use davp::modules::verification::verify_proof;
 use davp::KeypairBytes;
@@ -46,6 +47,9 @@ enum Commands {
 
         #[arg(long)]
         parent_verification_id: Option<String>,
+
+        #[arg(long)]
+        issuer_certificate_id: Option<String>,
 
         #[arg(long, default_value = "davp_storage")]
         storage_dir: PathBuf,
@@ -115,6 +119,7 @@ async fn main() -> Result<()> {
             description,
             tags,
             parent_verification_id,
+            issuer_certificate_id,
             storage_dir,
             replicate_to,
         } => {
@@ -126,10 +131,18 @@ async fn main() -> Result<()> {
             let proof = create_proof_from_bytes(&bytes, at, ai_assisted, metadata, &kp)?;
 
             let storage = Storage::new(storage_dir);
-            storage.store_proof(&proof)?;
+            let published = PublishedProof {
+                proof: proof.clone(),
+                issuer_certificate_id,
+            };
+            storage.store_published_proof(&published)?;
 
             if let Some(peers) = replicate_to {
-                replicate_proof(&proof, &peers).await;
+                if published.issuer_certificate_id.is_some() {
+                    replicate_published_proof(&published, &peers).await;
+                } else {
+                    replicate_proof(&proof, &peers).await;
+                }
             }
 
             println!("verification_id={}", proof.verification_id);
