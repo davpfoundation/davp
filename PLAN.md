@@ -1,119 +1,200 @@
-davp - decentralized asset verification protocol
+DAVP Issuer Certificate
+DAVP
+
+davp – decentralized asset verification protocol
 
 goal
 - prove authorship, integrity, timestamp of digital assets
 - support text, code, images, videos, artworks
 - verification always free
-- optional paid/enterprise services for bulk, guarantees, api
+- optional paid / enterprise services for bulk, guarantees, api
 
 core concepts
-- asset hash: blake3 of file/content
-- creator id: public key (ed25519 preferred for speed & security)
-- timestamp: utc of creation
-- metadata: type, ai_assisted flag, optional tags, protocol version, parent verification_id (for derivatives)
-- signature: creator signs hash+metadata+timestamp with private key
-- verification id: long unique id (~64 chars, random letters+numbers, base58 encoding recommended)
+- asset hash: blake3 of file or content
+- creator id: public key (ed25519 for speed and security)
+- timestamp: utc time of proof creation
+- metadata:
+  - asset type
+  - ai_assisted flag
+  - optional tags / description
+  - protocol version
+  - parent verification_id (for derivatives or updates)
+- signature: creator signs (hash + metadata + timestamp)
+- verification id:
+  - long unique identifier (~64 chars)
+  - random
+  - base58 encoding recommended
+  - globally unique reference to a proof
 
-proof object / license
-{
-  asset_hash: blake3 of content
-  creator_public_key: pubkey
-  timestamp: utc
-  asset_type: text/image/video/code
-  ai_assisted: true/false
-  metadata: optional tags/description/origin, protocol version, parent verification_id
-  signature: signed(hash+metadata+timestamp)
-  verification_id: long unique id (~64 chars)
-}
+proof object
+- asset_hash
+- creator_public_key
+- timestamp
+- asset_type
+- ai_assisted
+- metadata (tags, origin, protocol version, parent id)
+- signature
+- verification_id
 
 mvp flow
-1. upload asset
-2. calculate blake3 hash
-3. attach metadata + timestamp + type + ai flag + version info
-4. sign with private key (ed25519)
-5. store proof object (compact serialization: serde/bincode/cbor)
-6. generate verification id (random 64 chars, base58)
-7. replicate to decentralized nodes (gossip push/pull, validation at node)
-    - consensus: proof valid if hash + signature match
-    - optional micropayments for node storage
-    - ensures availability, immutability, censorship resistance
+1. user provides asset
+2. client computes blake3 hash
+3. client attaches metadata, timestamp, protocol version
+4. client signs data using ed25519 private key
+5. proof object is created (immutable)
+6. verification id is generated
+7. proof is broadcast to the network
+8. nodes validate and replicate proof
 
-verification
-- input: file/hash or verification_id
-- recalc hash
+verification flow
+- input: file, hash, or verification_id
+- recompute hash if file provided
 - verify signature with creator public key
-- check metadata/timestamp/version
-- result: valid/invalid
+- verify metadata and protocol version
+- output: valid or invalid
 
 asset lifecycle
-- creation → proof generation → publication → replication → verification
-- proofs immutable; updates create new proof objects
-- optional: batch/bulk registration, revocation, expiration
+- creation
+- proof generation
+- publication
+- replication
+- verification
+- updates produce new proof objects linked via parent verification_id
+- original proofs remain immutable
 
-decentralization / replication
-- nodes replicate proofs
-- gossip protocol keeps proofs synchronized
-- nodes reject invalid proofs
-- optional incentives for nodes storing/replicating proofs
+network architecture
+
+entities
+- client
+- cnt (common network tracker)
+- verified nodes
+
+cnt (common network tracker)
+- bootstrap-only component
+- stores a signed list of verified node endpoints
+- contains:
+  - node public key
+  - node address
+  - node id
+- does not store proofs
+- does not validate assets
+- does not route traffic
+- replaceable and mirrorable
+- protocol does not depend on cnt after bootstrap
+
+verified nodes
+- long-lived peers
+- identified by public key and node id
+- maintain peer tables
+- validate proofs before replication
+- gossip proofs and peer lists
+- no central authority
+
+client bootstrap and mesh formation
+1. client connects to cnt
+2. cnt returns list of verified nodes
+3. client connects to several nodes
+4. nodes share:
+   - their peers
+   - peers-of-peers
+   - known node metadata
+5. client recursively connects
+6. decentralized mesh is formed
+7. cnt no longer required after bootstrap
+
+decentralization and replication
+- proofs replicated across node mesh
+- gossip push / pull model
+- nodes reject invalid or unsigned proofs
+- availability through redundancy
+- censorship resistance through distribution
+- optional incentives for storage and uptime
+
+consensus rule (minimal)
+- a proof is valid if:
+  - hash matches content
+  - signature verifies
+  - metadata is well-formed
+- no global ordering required
+- no chain, no blocks
 
 security
-- hashes: blake3 for speed + collision resistance
-- signatures: ed25519 (fast, cross-platform)
-- verification id: 64 chars, random letters+numbers, base58 recommended
+- blake3 hashing for speed and collision resistance
+- ed25519 signatures for fast verification
 - metadata fully signed
-- nodes validate before replication
-- future-proof: protocol versioning + parent verification_id for derivatives
+- immutable proofs
+- protocol versioning for forward compatibility
+- parent verification_id enables derivative tracking
+- cryptographic trust only, no trust by position
 
 monetization
 - protocol usage always free
-- businesses/companies pay for:
-    - bulk asset registration
-    - legal-grade timestamping / certified proofs
-    - api access for verification/registration at scale
-    - trusted issuer keys / certification recognized by platforms
-- free users verify and register small volumes without paying
-- revenue comes from guarantees, scale, trust, and enterprise adoption
-- no protocol-level payment enforcement needed
-- protocol remains open and decentralized, money flows from value-added services
+- businesses and companies pay for:
+  - bulk registration
+  - certified or legal-grade timestamps
+  - enterprise api access
+  - operating trusted or certified nodes
+  - issuer keys recognized by platforms
+- payments handled out-of-band
+- no protocol-level payment enforcement
+- protocol remains open and decentralized
 
 adoption strategy
-- start with single asset type (text/code/images)
-- build reference implementation: upload, proof generation, verification api
-- sdk/docs for developers
-- seed adoption with 1-3 platforms
-- expand to billions as invisible infra
+- start with text, code, images
+- reference rust implementation
+- client + node + cnt provided
+- sdk and documentation
+- seed with early platforms
+- scale as invisible infrastructure
 
-ascii diagram (minimal)
+functional schematic
 
-file/content
-    |
-    v
-calculate blake3 hash
-    |
-    v
-attach metadata + type + timestamp + ai flag + version + parent verification_id
-    |
-    v
-sign(hash + metadata + timestamp) with ed25519 private key
-    |
-    v
-generate verification id (~64 chars, base58)
-    |
-    v
-store proof + replicate to decentralized nodes
-    |
-    v
-anyone can verify:
-- file/hash or verification id
-- check signature
-- check metadata/timestamp/version
-- result: valid/invalid
+asset
+ -> blake3 hash
+ -> metadata + timestamp + version
+ -> ed25519 signature
+ -> verification id
+ -> client
+ -> cnt (bootstrap only)
+ -> verified nodes
+ -> gossip replication
+ -> global verification
 
-notes / rust implementation hints
-- use serde + bincode/cbor for compact, fast serialization
-- async networking for replication & verification queries
+rust implementation notes
+- serde with bincode or cbor for compact proofs
+- async networking (tokio)
 - immutable structs for proof objects
-- nodes validate proofs before gossiping
-- versioning in metadata ensures forward compatibility
-- use base58 encoding for verification id to avoid confusing chars
-- prioritize speed & security: blake3 + ed25519 + minimal data per proof
+- strict validation before gossip
+- base58 for identifiers
+- prioritize minimal data, speed, and safety
+
+proof contains:
+- creator public key
+- signature
+- verification id
+- optional issuer_certificate_id
+
+protocol only checks:
+- hash + signature -> valid/invalid
+
+issuer certificate:
+- stored off-chain (website / JSON repo)
+- maps certificate id -> org info + CA signature
+- queried by users/apps to show "verified by ORGNAME"
+
+behavior:
+- anyone can submit proof with cert id
+- verification sees cryptographic validity
+- optional: user opens cert repo to see organization info
+
+user verifies a proof in the protocol → sees valid / invalid (cryptographically)
+
+proof has issuer_certificate_id → optional, may exist or be blank
+if verifier wants to know organization info:
+
+1 copy issuer_certificate_id
+2 query your certificate repository (website, JSON repo, or API)
+3 see organization name, metadata, validity period, trusted CA signature
+
+this keeps protocol simple and decentralized
+(optional) organization display is purely application-level

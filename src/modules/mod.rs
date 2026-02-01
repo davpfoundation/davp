@@ -3,6 +3,7 @@ pub mod asset;
 pub mod bootstrap;
 pub mod certification;
 pub mod hash;
+pub mod issuer_certificate;
 pub mod metadata;
 pub mod network;
 pub mod signature;

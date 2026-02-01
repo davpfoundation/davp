@@ -4,9 +4,14 @@ use davp::modules::asset::create_proof_from_bytes;
 use davp::modules::certification::PublishedProof;
 use davp::modules::hash::blake3_hash_bytes;
 use davp::modules::bootstrap::{report_and_get_peers, PeerEntry, PeerReport};
+use davp::modules::issuer_certificate::{
+    DEFAULT_CERTS_URL, IssuerCertificationDetailed, IssuerCertificationStatus, fetch_certificate_bundle,
+    verify_issuer_certificate_detailed,
+};
 use davp::modules::metadata::{AssetType, Metadata};
 use davp::modules::network::{
-    fetch_ids_by_hash_from_peers, fetch_proof_from_peers, replicate_published_proof, replicate_proof,
+    fetch_ids_by_hash_from_peers, fetch_proof_from_peers, fetch_published_proof_from_peers,
+    replicate_published_proof, replicate_proof,
     run_node_with_shutdown, NodeConfig, PeerConnections, ping_peer,
 };
 use davp_bootstrap_server::run_server_with_shutdown;
@@ -14,12 +19,51 @@ use davp::modules::storage::Storage;
 use davp::modules::verification::verify_proof;
 use davp::KeypairBytes;
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio::sync::watch;
 use tokio::sync::RwLock;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct CntTrackerEntry {
+    name: String,
+    addr: String,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+struct GuiSettingsFile {
+    cnt_selected_addr: Option<String>,
+    cnt_trackers: Vec<CntTrackerEntry>,
+    certs_url: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct VerifyResultView {
+    verification_id: String,
+    creator_public_key_base64: String,
+    signature_base64: String,
+    issuer_certificate_id: Option<String>,
+    issuer_certified: bool,
+    organization_name: Option<String>,
+    issuer_unverified_reason: Option<String>,
+}
+
+fn issuer_unverified_reason(d: &IssuerCertificationDetailed) -> Option<String> {
+    match d {
+        IssuerCertificationDetailed::Certified { .. } => None,
+        IssuerCertificationDetailed::NotFound => Some("certificate_id not found in certs.json".to_string()),
+        IssuerCertificationDetailed::InvalidCaSignature => Some("certificate CA signature invalid".to_string()),
+        IssuerCertificationDetailed::InvalidValidityWindow => Some("certificate not valid now (expired/not yet valid/invalid window)".to_string()),
+        IssuerCertificationDetailed::InvalidIssuerPublicKey => Some("certificate issuer_public_key is invalid base64/length".to_string()),
+        IssuerCertificationDetailed::IssuerKeyMismatch => Some(
+            "issuer key mismatch: proof.creator_public_key != certificate.issuer_public_key (you signed the proof with the wrong keypair)"
+                .to_string(),
+        ),
+    }
+}
 
 fn main() -> Result<()> {
     let native_options = eframe::NativeOptions {
@@ -45,6 +89,11 @@ struct DavpApp {
 
     cnt_server: String,
     cnt_enabled: bool,
+
+    cnt_selected_addr: String,
+    cnt_trackers: Vec<CntTrackerEntry>,
+    cnt_new_name: String,
+    cnt_new_addr: String,
 
     node_bind: String,
     max_peers: usize,
@@ -80,11 +129,18 @@ struct DavpApp {
     create_parent_verification_id: String,
     create_issuer_certificate_id: String,
     created_verification_id: String,
+    created_creator_public_key_base64: String,
+    created_signature_base64: String,
+    created_issuer_certificate_id_display: String,
 
     // verify
     verify_verification_id: String,
     verify_file_path: String,
     verify_status: String,
+    verify_view: Option<VerifyResultView>,
+
+    certs_url: String,
+    certs_last_fetch_status: String,
 
     last_error: String,
 
@@ -96,12 +152,17 @@ impl Default for DavpApp {
     fn default() -> Self {
         let peers_arc: Arc<RwLock<Vec<SocketAddr>>> = Arc::new(RwLock::new(Vec::new()));
         let peer_graph: Arc<RwLock<HashMap<SocketAddr, Vec<SocketAddr>>>> = Arc::new(RwLock::new(HashMap::new()));
-        Self {
+        let mut s = Self {
             tab: Tab::default(),
             storage_dir: "davp_storage".to_string(),
             peers: "".to_string(),
             cnt_server: "127.0.0.1:9100".to_string(),
             cnt_enabled: false,
+
+            cnt_selected_addr: "127.0.0.1:9100".to_string(),
+            cnt_trackers: Vec::new(),
+            cnt_new_name: String::new(),
+            cnt_new_addr: String::new(),
             node_bind: "127.0.0.1:9002".to_string(),
             max_peers: 10,
             run_node_enabled: true,
@@ -132,16 +193,25 @@ impl Default for DavpApp {
             create_parent_verification_id: String::new(),
             create_issuer_certificate_id: String::new(),
             created_verification_id: String::new(),
+            created_creator_public_key_base64: String::new(),
+            created_signature_base64: String::new(),
+            created_issuer_certificate_id_display: String::new(),
 
             verify_verification_id: String::new(),
             verify_file_path: String::new(),
             verify_status: String::new(),
+            verify_view: None,
+
+            certs_url: DEFAULT_CERTS_URL.to_string(),
+            certs_last_fetch_status: String::new(),
 
             last_error: String::new(),
 
             manual_connect_open: false,
             manual_connect_addr: String::new(),
-        }
+        };
+        s.load_gui_settings();
+        s
     }
 }
 
@@ -151,6 +221,7 @@ enum Tab {
     Create,
     Verify,
     Keygen,
+    Settings,
 }
 
 impl eframe::App for DavpApp {
@@ -160,6 +231,7 @@ impl eframe::App for DavpApp {
                 ui.selectable_value(&mut self.tab, Tab::Create, "Create");
                 ui.selectable_value(&mut self.tab, Tab::Verify, "Verify");
                 ui.selectable_value(&mut self.tab, Tab::Keygen, "Keygen");
+                ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
             });
 
             ui.separator();
@@ -208,7 +280,13 @@ impl eframe::App for DavpApp {
                             ui.checkbox(&mut self.run_node_enabled, "Run node");
                         });
 
-                        ui.label(format!("CNT tracker: {}", self.cnt_server));
+                        let cnt_name = self
+                            .all_cnt_trackers()
+                            .into_iter()
+                            .find(|t| t.1 == self.cnt_selected_addr)
+                            .map(|t| t.0)
+                            .unwrap_or_else(|| "CNT World".to_string());
+                        ui.label(format!("CNT tracker: {} ({})", cnt_name, self.cnt_selected_addr));
 
 
 
@@ -395,8 +473,219 @@ impl eframe::App for DavpApp {
                 Tab::Create => self.ui_create(ui),
                 Tab::Verify => self.ui_verify(ui),
                 Tab::Keygen => self.ui_keygen(ui),
+                Tab::Settings => self.ui_settings(ui),
             }
         });
+    }
+}
+
+impl DavpApp {
+    fn all_cnt_trackers(&self) -> Vec<(String, String)> {
+        let mut v = vec![("CNT World".to_string(), "127.0.0.1:9100".to_string())];
+        for t in &self.cnt_trackers {
+            v.push((t.name.clone(), t.addr.clone()));
+        }
+        v
+    }
+
+    fn settings_path(&self) -> PathBuf {
+        PathBuf::from(self.storage_dir.trim()).join("gui_settings.json")
+    }
+
+    fn load_gui_settings(&mut self) {
+        let path = self.settings_path();
+        let Ok(bytes) = std::fs::read(&path) else {
+            self.cnt_selected_addr = "127.0.0.1:9100".to_string();
+            self.cnt_server = self.cnt_selected_addr.clone();
+            return;
+        };
+        let Ok(s) = String::from_utf8(bytes) else {
+            self.cnt_selected_addr = "127.0.0.1:9100".to_string();
+            self.cnt_server = self.cnt_selected_addr.clone();
+            return;
+        };
+        let Ok(settings) = serde_json::from_str::<GuiSettingsFile>(&s) else {
+            self.cnt_selected_addr = "127.0.0.1:9100".to_string();
+            self.cnt_server = self.cnt_selected_addr.clone();
+            return;
+        };
+        self.cnt_trackers = settings.cnt_trackers;
+        if let Some(addr) = settings.cnt_selected_addr {
+            if self
+                .all_cnt_trackers()
+                .iter()
+                .any(|(_, a)| a.trim() == addr.trim())
+            {
+                self.cnt_selected_addr = addr;
+            } else {
+                self.cnt_selected_addr = "127.0.0.1:9100".to_string();
+            }
+        } else {
+            self.cnt_selected_addr = "127.0.0.1:9100".to_string();
+        }
+        self.cnt_server = self.cnt_selected_addr.clone();
+
+        if let Some(url) = settings.certs_url {
+            let url = url.trim().to_string();
+            if !url.is_empty() {
+                self.certs_url = url;
+            }
+        }
+    }
+
+    fn save_gui_settings(&self) -> std::result::Result<(), String> {
+        let base = PathBuf::from(self.storage_dir.trim());
+        std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
+        let path = self.settings_path();
+        let settings = GuiSettingsFile {
+            cnt_selected_addr: Some(self.cnt_selected_addr.clone()),
+            cnt_trackers: self.cnt_trackers.clone(),
+            certs_url: Some(self.certs_url.clone()),
+        };
+        let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+        std::fs::write(&path, json).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn ui_settings(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Settings");
+        ui.add_space(8.0);
+
+        ui.add_enabled_ui(!self.networking_started, |ui| {
+            ui.label("Issuer certificates URL:");
+            ui.text_edit_singleline(&mut self.certs_url);
+            if ui.button("Save").clicked() {
+                if self.certs_url.trim().is_empty() {
+                    self.last_error = "certs URL cannot be empty".to_string();
+                } else if let Err(e) = self.save_gui_settings() {
+                    self.last_error = e;
+                }
+            }
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.label("CNT tracker:");
+
+            let trackers = self.all_cnt_trackers();
+            let mut selected = trackers
+                .iter()
+                .position(|(_, addr)| addr.trim() == self.cnt_selected_addr.trim())
+                .unwrap_or(0);
+
+            egui::ComboBox::from_id_source("cnt_tracker_select")
+                .selected_text(format!("{} ({})", trackers[selected].0, trackers[selected].1))
+                .show_ui(ui, |ui: &mut egui::Ui| {
+                    for (i, (name, addr)) in trackers.iter().enumerate() {
+                        ui.selectable_value(&mut selected, i, format!("{} ({})", name, addr));
+                    }
+                });
+
+            let new_addr = trackers
+                .get(selected)
+                .map(|t| t.1.clone())
+                .unwrap_or_else(|| "127.0.0.1:9100".to_string());
+            if new_addr.trim() != self.cnt_selected_addr.trim() {
+                self.cnt_selected_addr = new_addr;
+                self.cnt_server = self.cnt_selected_addr.clone();
+                if let Err(e) = self.save_gui_settings() {
+                    self.last_error = e;
+                }
+            }
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.label("Add custom CNT tracker:");
+            ui.horizontal(|ui| {
+                ui.label("Name:");
+                ui.text_edit_singleline(&mut self.cnt_new_name);
+            });
+            ui.horizontal(|ui| {
+                ui.label("Addr (host:port):");
+                ui.text_edit_singleline(&mut self.cnt_new_addr);
+            });
+            if ui.button("Add tracker").clicked() {
+                let name = self.cnt_new_name.trim().to_string();
+                let addr = self.cnt_new_addr.trim().to_string();
+                if name.is_empty() {
+                    self.last_error = "tracker name cannot be empty".to_string();
+                } else if addr.is_empty() {
+                    self.last_error = "tracker addr cannot be empty".to_string();
+                } else if addr.parse::<SocketAddr>().is_err() {
+                    self.last_error = "tracker addr must be host:port".to_string();
+                } else if self.all_cnt_trackers().iter().any(|(_, a)| a.trim() == addr.trim()) {
+                    self.last_error = "tracker addr already exists".to_string();
+                } else {
+                    self.cnt_trackers.push(CntTrackerEntry { name, addr: addr.clone() });
+                    self.cnt_selected_addr = addr;
+                    self.cnt_server = self.cnt_selected_addr.clone();
+                    self.cnt_new_name.clear();
+                    self.cnt_new_addr.clear();
+                    if let Err(e) = self.save_gui_settings() {
+                        self.last_error = e;
+                    }
+                }
+            }
+
+            if !self.cnt_trackers.is_empty() {
+                ui.add_space(10.0);
+                ui.separator();
+                ui.label("Custom CNT trackers:");
+                let mut remove_addr: Option<String> = None;
+                for t in &self.cnt_trackers {
+                    ui.horizontal(|ui| {
+                        ui.monospace(format!("{} ({})", t.name, t.addr));
+                        if ui.button("Remove").clicked() {
+                            remove_addr = Some(t.addr.clone());
+                        }
+                    });
+                }
+                if let Some(addr) = remove_addr {
+                    self.cnt_trackers.retain(|t| t.addr.trim() != addr.trim());
+                    if self.cnt_selected_addr.trim() == addr.trim() {
+                        self.cnt_selected_addr = "127.0.0.1:9100".to_string();
+                        self.cnt_server = self.cnt_selected_addr.clone();
+                    }
+                    if let Err(e) = self.save_gui_settings() {
+                        self.last_error = e;
+                    }
+                }
+            }
+        });
+
+        if self.networking_started {
+            ui.add_space(6.0);
+            ui.colored_label(egui::Color32::YELLOW, "Stop networking to change CNT tracker settings.");
+        }
+    }
+
+    fn fetch_certs_bundle_for_verify(
+        &mut self,
+    ) -> std::result::Result<davp::modules::issuer_certificate::IssuerCertificateBundle, String> {
+        let url = if self.certs_url.trim().is_empty() {
+            DEFAULT_CERTS_URL
+        } else {
+            self.certs_url.trim()
+        };
+
+        let res = self
+            .rt
+            .block_on(fetch_certificate_bundle(url))
+            .map_err(|e| e.to_string());
+
+        match &res {
+            Ok(b) => {
+                self.certs_last_fetch_status = format!(
+                    "loaded {} certificate(s) from {}",
+                    b.certificates.len(),
+                    url
+                );
+            }
+            Err(e) => {
+                self.certs_last_fetch_status = format!("failed to fetch {}: {}", url, e);
+            }
+        }
+
+        res
     }
 }
 
@@ -687,6 +976,17 @@ impl DavpApp {
             ui.separator();
             ui.label("Created verification_id:");
             ui.monospace(&self.created_verification_id);
+
+            ui.label("Creator public key (base64):");
+            ui.monospace(&self.created_creator_public_key_base64);
+
+            ui.label("Signature (base64):");
+            ui.monospace(&self.created_signature_base64);
+
+            if !self.created_issuer_certificate_id_display.is_empty() {
+                ui.label("Issuer certificate id:");
+                ui.monospace(&self.created_issuer_certificate_id_display);
+            }
         }
     }
 
@@ -715,9 +1015,83 @@ impl DavpApp {
         }
 
         ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label("certs_url:");
+            ui.monospace(self.certs_url.trim());
+            if ui.button("Refresh certs").clicked() {
+                let _ = self.fetch_certs_bundle_for_verify();
+            }
+        });
+        if !self.certs_last_fetch_status.is_empty() {
+            ui.monospace(&self.certs_last_fetch_status);
+        }
+
+        ui.add_space(6.0);
         ui.label("Tip: leave verification_id empty to verify by file only (it will compute hash and search peers/local index).");
 
-        if !self.verify_status.is_empty() {
+        if let Some(v) = &self.verify_view {
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Result:");
+                ui.colored_label(egui::Color32::GREEN, "valid");
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("verification_id:");
+                ui.monospace(&v.verification_id);
+                if ui.button("Copy").clicked() {
+                    ui.output_mut(|o| o.copied_text = v.verification_id.clone());
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("creator_public_key:");
+                ui.monospace(&v.creator_public_key_base64);
+                if ui.button("Copy").clicked() {
+                    ui.output_mut(|o| o.copied_text = v.creator_public_key_base64.clone());
+                }
+            });
+
+            ui.horizontal(|ui| {
+                ui.label("signature:");
+                ui.monospace(&v.signature_base64);
+                if ui.button("Copy").clicked() {
+                    ui.output_mut(|o| o.copied_text = v.signature_base64.clone());
+                }
+            });
+
+            if let Some(id) = &v.issuer_certificate_id {
+                ui.horizontal(|ui| {
+                    ui.label("issuer_certificate_id:");
+                    ui.monospace(id);
+                    if ui.button("Copy").clicked() {
+                        ui.output_mut(|o| o.copied_text = id.clone());
+                    }
+                });
+                if v.issuer_certified {
+                    if let Some(org) = &v.organization_name {
+                        ui.colored_label(egui::Color32::GREEN, format!("certified issuer: {}", org));
+                    } else {
+                        ui.colored_label(egui::Color32::GREEN, "certified issuer");
+                    }
+                } else {
+                    ui.colored_label(egui::Color32::YELLOW, "unverified issuer");
+                    if let Some(r) = &v.issuer_unverified_reason {
+                        ui.monospace(r);
+                    }
+                }
+            } else {
+                ui.colored_label(egui::Color32::YELLOW, "unverified issuer");
+            }
+
+            egui::CollapsingHeader::new("Raw status")
+                .default_open(false)
+                .show(ui, |ui| {
+                    if !self.verify_status.is_empty() {
+                        ui.monospace(&self.verify_status);
+                    }
+                });
+        } else if !self.verify_status.is_empty() {
             ui.separator();
             ui.label("Status:");
             ui.monospace(&self.verify_status);
@@ -771,7 +1145,7 @@ impl DavpApp {
         let storage = Storage::new(self.storage_dir.clone());
         let published = PublishedProof {
             proof: proof.clone(),
-            issuer_certificate_id,
+            issuer_certificate_id: issuer_certificate_id.clone(),
         };
         storage.store_published_proof(&published).map_err(|e| e.to_string())?;
 
@@ -791,6 +1165,11 @@ impl DavpApp {
         }
 
         self.created_verification_id = proof.verification_id;
+        self.created_creator_public_key_base64 =
+            base64::engine::general_purpose::STANDARD.encode(proof.creator_public_key);
+        self.created_signature_base64 =
+            base64::engine::general_purpose::STANDARD.encode(proof.signature.0);
+        self.created_issuer_certificate_id_display = issuer_certificate_id.unwrap_or_default();
         Ok(())
     }
 
@@ -809,6 +1188,7 @@ impl DavpApp {
         };
 
         if vid.is_empty() {
+            self.verify_view = None;
             let bytes = content.ok_or_else(|| "file is required when verification_id is empty".to_string())?;
             let asset_hash = blake3_hash_bytes(&bytes);
 
@@ -824,50 +1204,287 @@ impl DavpApp {
             }
 
             for id in ids {
-                let proof = if storage.contains(&id) {
-                    storage.retrieve_proof(&id).map_err(|e| e.to_string())?
+                let published = if storage.contains(&id) {
+                    storage.retrieve_published_proof(&id).map_err(|e| e.to_string())?
                 } else if !peers.is_empty() {
-                    let maybe = self
+                    let maybe_published = self
                         .rt
-                        .block_on(fetch_proof_from_peers(&peers, &id))
+                        .block_on(fetch_published_proof_from_peers(&peers, &id))
                         .map_err(|e| e.to_string())?;
-                    let Some(p) = maybe else { continue };
-                    storage.store_proof(&p).map_err(|e| e.to_string())?;
-                    p
+                    if let Some(published) = maybe_published {
+                        storage
+                            .store_published_proof(&published)
+                            .map_err(|e| e.to_string())?;
+                        published
+                    } else {
+                        let maybe = self
+                            .rt
+                            .block_on(fetch_proof_from_peers(&peers, &id))
+                            .map_err(|e| e.to_string())?;
+                        let Some(p) = maybe else { continue };
+                        storage.store_proof(&p).map_err(|e| e.to_string())?;
+                        PublishedProof {
+                            proof: p,
+                            issuer_certificate_id: None,
+                        }
+                    }
                 } else {
                     continue;
                 };
 
-                if verify_proof(&proof, Some(&bytes)).is_ok() {
-                    self.verify_status = format!("valid (verification_id={})", proof.verification_id);
+                if verify_proof(&published.proof, Some(&bytes)).is_ok() {
+                    let mut status = String::new();
+                    status.push_str("valid\n");
+                    status.push_str(&format!("verification_id={}\n", published.proof.verification_id));
+                    status.push_str(&format!(
+                        "creator_public_key_base64={}\n",
+                        base64::engine::general_purpose::STANDARD.encode(published.proof.creator_public_key)
+                    ));
+                    status.push_str(&format!(
+                        "signature_base64={}\n",
+                        base64::engine::general_purpose::STANDARD.encode(published.proof.signature.0)
+                    ));
+                    if let Some(id) = published.issuer_certificate_id.as_deref() {
+                        status.push_str(&format!("issuer_certificate_id={}\n", id));
+
+                        let (cert_detailed, fetch_err_reason) = match self.fetch_certs_bundle_for_verify() {
+                            Ok(bundle) => {
+                                let ca_b64 = bundle
+                                    .certificates
+                                    .iter()
+                                    .find(|c| c.certificate_id.trim() == id.trim())
+                                    .and_then(|c| c.ca_public_key_base64.as_deref())
+                                    .or(bundle.ca_public_key_base64.as_deref())
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .map(|s| s.to_string())
+                                    .or_else(|| std::env::var("DAVP_CA_PUBLIC_KEY_BASE64").ok());
+
+                                match ca_b64 {
+                                    Some(ca_b64) => {
+                                        let ca_pk_bytes = base64::engine::general_purpose::STANDARD
+                                            .decode(ca_b64.trim())
+                                            .ok();
+                                        let ca_pk: Option<[u8; 32]> =
+                                            ca_pk_bytes.and_then(|b| b.try_into().ok());
+                                        match ca_pk {
+                                            Some(ca_pk) => {
+                                                let detailed = verify_issuer_certificate_detailed(
+                                                    &bundle.certificates,
+                                                    id,
+                                                    &published.proof.creator_public_key,
+                                                    &ca_pk,
+                                                    chrono::Utc::now(),
+                                                )
+                                                .unwrap_or(IssuerCertificationDetailed::InvalidCaSignature);
+                                                (detailed, None)
+                                            }
+                                            None => (IssuerCertificationDetailed::InvalidCaSignature, None),
+                                        }
+                                    }
+                                    None => (IssuerCertificationDetailed::InvalidCaSignature, None),
+                                }
+                            }
+                            Err(e) => (
+                                IssuerCertificationDetailed::NotFound,
+                                Some(format!("failed to fetch certs.json: {}", e)),
+                            ),
+                        };
+
+                        match cert_detailed {
+                            IssuerCertificationDetailed::Certified { organization_name } => {
+                                status.push_str("certified issuer\n");
+                                status.push_str(&format!("organization_name={}\n", organization_name));
+                                self.verify_view = Some(VerifyResultView {
+                                    verification_id: published.proof.verification_id.clone(),
+                                    creator_public_key_base64: base64::engine::general_purpose::STANDARD
+                                        .encode(published.proof.creator_public_key),
+                                    signature_base64: base64::engine::general_purpose::STANDARD
+                                        .encode(published.proof.signature.0),
+                                    issuer_certificate_id: Some(id.to_string()),
+                                    issuer_certified: true,
+                                    organization_name: Some(organization_name),
+                                    issuer_unverified_reason: None,
+                                });
+                            }
+                            _ => {
+                                status.push_str("unverified issuer\n");
+                                self.verify_view = Some(VerifyResultView {
+                                    verification_id: published.proof.verification_id.clone(),
+                                    creator_public_key_base64: base64::engine::general_purpose::STANDARD
+                                        .encode(published.proof.creator_public_key),
+                                    signature_base64: base64::engine::general_purpose::STANDARD
+                                        .encode(published.proof.signature.0),
+                                    issuer_certificate_id: Some(id.to_string()),
+                                    issuer_certified: false,
+                                    organization_name: None,
+                                    issuer_unverified_reason: fetch_err_reason
+                                        .or_else(|| issuer_unverified_reason(&cert_detailed)),
+                                });
+                            }
+                        }
+                    } else {
+                        status.push_str("unverified issuer\n");
+                        self.verify_view = Some(VerifyResultView {
+                            verification_id: published.proof.verification_id.clone(),
+                            creator_public_key_base64: base64::engine::general_purpose::STANDARD
+                                .encode(published.proof.creator_public_key),
+                            signature_base64: base64::engine::general_purpose::STANDARD
+                                .encode(published.proof.signature.0),
+                            issuer_certificate_id: None,
+                            issuer_certified: false,
+                            organization_name: None,
+                            issuer_unverified_reason: None,
+                        });
+                    }
+                    self.verify_status = status;
                     return Ok(());
                 }
             }
 
             self.verify_status = "not found".to_string();
+            self.verify_view = None;
             return Ok(());
         }
 
-        let proof = if storage.contains(&vid) {
-            storage.retrieve_proof(&vid).map_err(|e| e.to_string())?
+        let published = if storage.contains(&vid) {
+            storage.retrieve_published_proof(&vid).map_err(|e| e.to_string())?
         } else if !peers.is_empty() {
-            let maybe = self
+            let maybe_published = self
                 .rt
-                .block_on(fetch_proof_from_peers(&peers, &vid))
+                .block_on(fetch_published_proof_from_peers(&peers, &vid))
                 .map_err(|e| e.to_string())?;
-            let Some(p) = maybe else {
-                self.verify_status = "not found".to_string();
-                return Ok(());
-            };
-            storage.store_proof(&p).map_err(|e| e.to_string())?;
-            p
+            if let Some(published) = maybe_published {
+                storage
+                    .store_published_proof(&published)
+                    .map_err(|e| e.to_string())?;
+                published
+            } else {
+                let maybe = self
+                    .rt
+                    .block_on(fetch_proof_from_peers(&peers, &vid))
+                    .map_err(|e| e.to_string())?;
+                let Some(p) = maybe else {
+                    self.verify_status = "not found".to_string();
+                    return Ok(());
+                };
+                storage.store_proof(&p).map_err(|e| e.to_string())?;
+                PublishedProof {
+                    proof: p,
+                    issuer_certificate_id: None,
+                }
+            }
         } else {
             self.verify_status = "not found".to_string();
             return Ok(());
         };
 
-        verify_proof(&proof, content.as_deref()).map_err(|e| e.to_string())?;
-        self.verify_status = "valid".to_string();
+        verify_proof(&published.proof, content.as_deref()).map_err(|e| e.to_string())?;
+        let mut status = String::new();
+        status.push_str("valid\n");
+        status.push_str(&format!("verification_id={}\n", published.proof.verification_id));
+        status.push_str(&format!(
+            "creator_public_key_base64={}\n",
+            base64::engine::general_purpose::STANDARD.encode(published.proof.creator_public_key)
+        ));
+        status.push_str(&format!(
+            "signature_base64={}\n",
+            base64::engine::general_purpose::STANDARD.encode(published.proof.signature.0)
+        ));
+        if let Some(id) = published.issuer_certificate_id.as_deref() {
+            status.push_str(&format!("issuer_certificate_id={}\n", id));
+
+            let (cert_detailed, fetch_err_reason) = match self.fetch_certs_bundle_for_verify() {
+                Ok(bundle) => {
+                    let ca_b64 = bundle
+                        .certificates
+                        .iter()
+                        .find(|c| c.certificate_id.trim() == id.trim())
+                        .and_then(|c| c.ca_public_key_base64.as_deref())
+                        .or(bundle.ca_public_key_base64.as_deref())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                        .or_else(|| std::env::var("DAVP_CA_PUBLIC_KEY_BASE64").ok());
+
+                    match ca_b64 {
+                        Some(ca_b64) => {
+                            let ca_pk_bytes = base64::engine::general_purpose::STANDARD
+                                .decode(ca_b64.trim())
+                                .ok();
+                            let ca_pk: Option<[u8; 32]> = ca_pk_bytes.and_then(|b| b.try_into().ok());
+                            match ca_pk {
+                                Some(ca_pk) => {
+                                    let detailed = verify_issuer_certificate_detailed(
+                                        &bundle.certificates,
+                                        id,
+                                        &published.proof.creator_public_key,
+                                        &ca_pk,
+                                        chrono::Utc::now(),
+                                    )
+                                    .unwrap_or(IssuerCertificationDetailed::InvalidCaSignature);
+
+                                    (detailed, None)
+                                }
+                                None => (IssuerCertificationDetailed::InvalidCaSignature, None),
+                            }
+                        }
+                        None => (IssuerCertificationDetailed::InvalidCaSignature, None),
+                    }
+                }
+                Err(e) => (
+                    IssuerCertificationDetailed::NotFound,
+                    Some(format!("failed to fetch certs.json: {}", e)),
+                ),
+            };
+
+            match cert_detailed {
+                IssuerCertificationDetailed::Certified { organization_name } => {
+                    status.push_str("certified issuer\n");
+                    status.push_str(&format!("organization_name={}\n", organization_name));
+                    self.verify_view = Some(VerifyResultView {
+                        verification_id: published.proof.verification_id.clone(),
+                        creator_public_key_base64: base64::engine::general_purpose::STANDARD
+                            .encode(published.proof.creator_public_key),
+                        signature_base64: base64::engine::general_purpose::STANDARD
+                            .encode(published.proof.signature.0),
+                        issuer_certificate_id: Some(id.to_string()),
+                        issuer_certified: true,
+                        organization_name: Some(organization_name),
+                        issuer_unverified_reason: None,
+                    });
+                }
+                _ => {
+                    status.push_str("unverified issuer\n");
+                    self.verify_view = Some(VerifyResultView {
+                        verification_id: published.proof.verification_id.clone(),
+                        creator_public_key_base64: base64::engine::general_purpose::STANDARD
+                            .encode(published.proof.creator_public_key),
+                        signature_base64: base64::engine::general_purpose::STANDARD
+                            .encode(published.proof.signature.0),
+                        issuer_certificate_id: Some(id.to_string()),
+                        issuer_certified: false,
+                        organization_name: None,
+                        issuer_unverified_reason: fetch_err_reason
+                            .or_else(|| issuer_unverified_reason(&cert_detailed)),
+                    });
+                }
+            }
+        } else {
+            status.push_str("unverified issuer\n");
+            self.verify_view = Some(VerifyResultView {
+                verification_id: published.proof.verification_id.clone(),
+                creator_public_key_base64: base64::engine::general_purpose::STANDARD
+                    .encode(published.proof.creator_public_key),
+                signature_base64: base64::engine::general_purpose::STANDARD
+                    .encode(published.proof.signature.0),
+                issuer_certificate_id: None,
+                issuer_certified: false,
+                organization_name: None,
+                issuer_unverified_reason: None,
+            });
+        }
+        self.verify_status = status;
         Ok(())
     }
 }

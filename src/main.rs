@@ -4,6 +4,10 @@ use clap::{Parser, Subcommand};
 use davp::modules::asset::create_proof_from_bytes;
 use davp::modules::bootstrap::{report_and_get_peers, PeerReport};
 use davp::modules::certification::PublishedProof;
+use davp::modules::issuer_certificate::{
+    DEFAULT_CERTS_URL, IssuerCertificationStatus, fetch_certificate_bundle, fetch_certificates,
+    parse_certificates_json, verify_issuer_certificate,
+};
 use davp::modules::metadata::{AssetType, Metadata};
 use davp::modules::network::{ping_peer, replicate_published_proof, replicate_proof, run_node, NodeConfig, PeerConnections};
 use davp::modules::storage::Storage;
@@ -59,11 +63,29 @@ enum Commands {
     },
 
     Verify {
-        #[arg(long)]
+        #[arg(long, alias = "verification_id")]
         verification_id: String,
 
-        #[arg(long)]
+        #[arg(long, alias = "file")]
         file: Option<PathBuf>,
+
+        #[arg(long, alias = "ca_public_key_base64")]
+        ca_public_key_base64: Option<String>,
+
+        #[arg(long, alias = "ca_keypair_base64")]
+        ca_keypair_base64: Option<String>,
+
+        #[arg(long, alias = "certs_url", default_value = DEFAULT_CERTS_URL)]
+        certs_url: String,
+
+        #[arg(long, alias = "certs_file")]
+        certs_file: Option<PathBuf>,
+
+        #[arg(long, alias = "certs_json")]
+        certs_json: Option<String>,
+
+        #[arg(long, alias = "certs_json_base64")]
+        certs_json_base64: Option<String>,
 
         #[arg(long, default_value = "davp_storage")]
         storage_dir: PathBuf,
@@ -146,23 +168,288 @@ async fn main() -> Result<()> {
             }
 
             println!("verification_id={}", proof.verification_id);
+            println!(
+                "creator_public_key_base64={}",
+                STANDARD.encode(proof.creator_public_key)
+            );
+            println!("signature_base64={}", STANDARD.encode(proof.signature.0));
+            if let Some(id) = published.issuer_certificate_id.as_deref() {
+                println!("issuer_certificate_id={}", id);
+            }
             Ok(())
         }
         Commands::Verify {
             verification_id,
             file,
+            ca_public_key_base64,
+            ca_keypair_base64,
+            certs_url,
+            certs_file,
+            certs_json,
+            certs_json_base64,
             storage_dir,
         } => {
             let storage = Storage::new(storage_dir);
-            let proof = storage.retrieve_proof(&verification_id)?;
+            let published = storage.retrieve_published_proof(&verification_id)?;
 
             let content = match file {
                 Some(path) => Some(std::fs::read(path)?),
                 None => None,
             };
 
-            verify_proof(&proof, content.as_deref())?;
+            verify_proof(&published.proof, content.as_deref())?;
             println!("valid");
+            println!("verification_id={}", published.proof.verification_id);
+            println!(
+                "creator_public_key_base64={}",
+                STANDARD.encode(published.proof.creator_public_key)
+            );
+            println!(
+                "signature_base64={}",
+                STANDARD.encode(published.proof.signature.0)
+            );
+
+            let debug_cert = std::env::var("DAVP_CERT_DEBUG")
+                .ok()
+                .is_some_and(|v| v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"));
+            match published.issuer_certificate_id.as_deref() {
+                Some(id) => {
+                    println!("issuer_certificate_id={}", id);
+
+                    // CA key source precedence:
+                    // 1) CLI/env override
+                    // 2) cert bundle ca_public_key_base64
+                    let ca_pk_override_b64 = ca_public_key_base64
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                        .or_else(|| std::env::var("DAVP_CA_PUBLIC_KEY_BASE64").ok());
+
+                    let ca_pk: Option<[u8; 32]> = if let Some(b64) = ca_pk_override_b64 {
+                        let ca_pk_bytes = match STANDARD.decode(b64.trim()) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                if debug_cert {
+                                    eprintln!("issuer_cert_debug: CA public key base64 decode failed: {}", e);
+                                }
+                                println!("unverified issuer");
+                                return Ok(());
+                            }
+                        };
+                        let ca_pk_len = ca_pk_bytes.len();
+                        match ca_pk_bytes.as_slice().try_into() {
+                            Ok(a) => Some(a),
+                            Err(_) => {
+                                if debug_cert {
+                                    eprintln!(
+                                        "issuer_cert_debug: CA public key must be 32 bytes, got {} bytes",
+                                        ca_pk_len
+                                    );
+                                }
+                                None
+                            }
+                        }
+                    } else {
+                        let bundle = match fetch_certificate_bundle(&certs_url).await {
+                            Ok(b) => b,
+                            Err(e) => {
+                                if debug_cert {
+                                    eprintln!("issuer_cert_debug: failed to fetch cert bundle: {:#}", e);
+                                }
+                                println!("unverified issuer");
+                                return Ok(());
+                            }
+                        };
+
+                        if debug_cert {
+                            eprintln!(
+                                "issuer_cert_debug: bundle.ca_public_key_base64 present={}",
+                                bundle.ca_public_key_base64.as_deref().map(str::trim).filter(|s| !s.is_empty()).is_some()
+                            );
+                        }
+
+                        match bundle.ca_public_key_base64.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                            Some(b64) => {
+                                match STANDARD.decode(b64) {
+                                    Ok(bytes) => bytes.as_slice().try_into().ok(),
+                                    Err(e) => {
+                                        if debug_cert {
+                                            eprintln!("issuer_cert_debug: bundle CA public key base64 decode failed: {}", e);
+                                        }
+                                        None
+                                    }
+                                }
+                            }
+                            None => None,
+                        }
+                    };
+
+                    let Some(ca_pk) = ca_pk else {
+                        if debug_cert {
+                            eprintln!("issuer_cert_debug: no CA public key available (need bundle.ca_public_key_base64 or override)");
+                        }
+                        println!("unverified issuer");
+                        return Ok(());
+                    };
+
+                        let status = (|| async {
+                            let certs = if let Some(b64) = &certs_json_base64 {
+                                if debug_cert {
+                                    eprintln!("issuer_cert_debug: loading certificates from --certs_json_base64");
+                                }
+                                let bytes = STANDARD.decode(b64.trim()).map_err(|e| {
+                                    anyhow!("failed to base64-decode certs_json_base64: {}", e)
+                                })?;
+                                let json = String::from_utf8(bytes)
+                                    .map_err(|e| anyhow!("certs_json_base64 is not valid utf8: {}", e))?;
+                                parse_certificates_json(&json)?
+                            } else if let Some(json) = &certs_json {
+                                if debug_cert {
+                                    eprintln!("issuer_cert_debug: loading certificates from --certs_json (inline)");
+                                }
+                                parse_certificates_json(json)?
+                            } else if let Some(path) = &certs_file {
+                                if debug_cert {
+                                    eprintln!(
+                                        "issuer_cert_debug: attempting to read certs_file {}",
+                                        path.to_string_lossy()
+                                    );
+                                    if let Ok(abs) = std::fs::canonicalize(path) {
+                                        eprintln!(
+                                            "issuer_cert_debug: certs_file canonical path {}",
+                                            abs.to_string_lossy()
+                                        );
+                                    }
+                                }
+                                let json = std::fs::read_to_string(path).map_err(|e| {
+                                    anyhow!(
+                                        "failed to read certs_file {}: {}",
+                                        path.to_string_lossy(),
+                                        e
+                                    )
+                                })?;
+                                parse_certificates_json(&json)?
+                            } else {
+                                fetch_certificates(&certs_url).await?
+                            };
+                            if debug_cert {
+                                if certs_json_base64.is_some() {
+                                    eprintln!("issuer_cert_debug: certificates source=certs_json_base64");
+                                } else if certs_json.is_some() {
+                                    eprintln!("issuer_cert_debug: certificates source=certs_json");
+                                } else if let Some(path) = &certs_file {
+                                    eprintln!("issuer_cert_debug: loaded certificates from file {}", path.to_string_lossy());
+                                } else {
+                                    eprintln!("issuer_cert_debug: fetched certificates from {}", certs_url);
+                                }
+                                eprintln!("issuer_cert_debug: certificate count={}", certs.len());
+                                for (i, c) in certs.iter().take(5).enumerate() {
+                                    eprintln!("issuer_cert_debug: cert[{}].certificate_id={}", i, c.certificate_id);
+                                }
+                            }
+                            let found = certs
+                                .iter()
+                                .any(|c| c.certificate_id.trim() == id.trim());
+
+                            if debug_cert {
+                                if let Some(cert) = certs.iter().find(|c| c.certificate_id.trim() == id.trim()) {
+                                    if let Some(kp_b64) = ca_keypair_base64
+                                        .as_deref()
+                                        .map(str::trim)
+                                        .filter(|s| !s.is_empty())
+                                        .map(|s| s.to_string())
+                                        .or_else(|| std::env::var("DAVP_CA_KEYPAIR_BASE64").ok())
+                                    {
+                                        use davp::modules::issuer_certificate::{
+                                            issuer_certificate_signing_payload_bytes,
+                                            issuer_certificate_signing_payload_bytes_legacy,
+                                        };
+                                        use davp::modules::signature::{sign, KeypairBytes};
+
+                                        match KeypairBytes::from_base64(&kp_b64) {
+                                            Ok(kp) => {
+                                                if let Ok(pk) = kp.public_key_bytes() {
+                                                    eprintln!(
+                                                        "issuer_cert_debug: CA public key derived from keypair = {}",
+                                                        STANDARD.encode(pk)
+                                                    );
+                                                }
+                                                let expected_current = issuer_certificate_signing_payload_bytes(cert)
+                                                    .and_then(|bytes| sign(&bytes, &kp))
+                                                    .map(|sig| STANDARD.encode(sig.0));
+                                                let expected_legacy = issuer_certificate_signing_payload_bytes_legacy(cert)
+                                                    .and_then(|bytes| sign(&bytes, &kp))
+                                                    .map(|sig| STANDARD.encode(sig.0));
+
+                                                let cert_sig = cert.ca_signature.trim();
+                                                let matches_current = expected_current.as_deref().is_ok_and(|s| s == cert_sig);
+                                                let matches_legacy = expected_legacy.as_deref().is_ok_and(|s| s == cert_sig);
+
+                                                if matches_current {
+                                                    eprintln!("issuer_cert_debug: ca_signature matches recomputed signature (current payload format)");
+                                                }
+                                                if matches_legacy {
+                                                    eprintln!("issuer_cert_debug: ca_signature matches recomputed signature (legacy payload format)");
+                                                }
+
+                                                if !matches_current && !matches_legacy {
+                                                    eprintln!("issuer_cert_debug: ca_signature MISMATCH");
+                                                    if let Ok(s) = &expected_current {
+                                                        eprintln!("issuer_cert_debug: expected_ca_signature_current={}", s);
+                                                    }
+                                                    if let Ok(s) = &expected_legacy {
+                                                        eprintln!("issuer_cert_debug: expected_ca_signature_legacy={}", s);
+                                                    }
+                                                    eprintln!("issuer_cert_debug: cert_ca_signature={}", cert_sig);
+                                                }
+                                            }
+                                            Err(e) => {
+                                                eprintln!("issuer_cert_debug: invalid CA keypair base64: {:#}", e);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            let res = verify_issuer_certificate(
+                                &certs,
+                                id,
+                                &published.proof.creator_public_key,
+                                &ca_pk,
+                                chrono::Utc::now(),
+                            );
+                            Ok::<(bool, IssuerCertificationStatus), anyhow::Error>((found, res?))
+                        })()
+                        .await;
+
+                        match status {
+                            Ok((_, IssuerCertificationStatus::Certified { organization_name })) => {
+                                println!("certified issuer");
+                                println!("organization_name={}", organization_name);
+                            }
+                            Ok((found, IssuerCertificationStatus::Unverified)) => {
+                                if debug_cert {
+                                    if found {
+                                        eprintln!("issuer_cert_debug: certificate found but issuer_public_key does not match proof.creator_public_key");
+                                    } else {
+                                        eprintln!("issuer_cert_debug: certificate_id not found in certs.json (possible CDN cache / wrong URL / cert not published)");
+                                    }
+                                }
+                                println!("unverified issuer");
+                            }
+                            Err(e) => {
+                                if debug_cert {
+                                    eprintln!("issuer_cert_debug: certificate verification failed: {:#}", e);
+                                }
+                                println!("unverified issuer");
+                            }
+                        }
+                }
+                None => {
+                    println!("unverified issuer");
+                }
+            }
             Ok(())
         }
         Commands::Node {

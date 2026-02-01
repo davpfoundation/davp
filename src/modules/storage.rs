@@ -1,11 +1,7 @@
 use crate::modules::asset::Proof;
-use crate::modules::certification::ProofIssuerTag;
-use crate::modules::certification::{IssuerCertificate, IssuerCertificateId, PublishedProof};
-use crate::modules::certification::tag_proof_issuer;
+use crate::modules::certification::{IssuerCertificateId, PublishedProof};
 use crate::modules::hash::AssetHash;
-use crate::modules::signature::PublicKeyBytes;
 use anyhow::{anyhow, Result};
-use chrono::Utc;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -91,41 +87,8 @@ impl Storage {
         })
     }
 
-    pub fn issuer_tag_for_proof(&self, verification_id: &str, ca_public_key: Option<&PublicKeyBytes>) -> Result<ProofIssuerTag> {
-        let published = self.retrieve_published_proof(verification_id)?;
-
-        let cert = match published.issuer_certificate_id.as_ref() {
-            Some(id) => self.retrieve_issuer_certificate(id).ok(),
-            None => None,
-        };
-
-        Ok(tag_proof_issuer(
-            &published.proof.creator_public_key,
-            published.issuer_certificate_id.as_deref(),
-            cert.as_ref(),
-            ca_public_key,
-            Utc::now(),
-        ))
-    }
-
     pub fn contains(&self, verification_id: &str) -> bool {
         self.proof_path(verification_id).exists()
-    }
-
-    pub fn store_issuer_certificate(&self, cert: &IssuerCertificate) -> Result<()> {
-        fs::create_dir_all(self.issuer_cert_dir())?;
-        let bytes = bincode::serialize(cert)?;
-        fs::write(self.issuer_cert_path(&cert.certificate_id), bytes)?;
-        Ok(())
-    }
-
-    pub fn retrieve_issuer_certificate(&self, certificate_id: &IssuerCertificateId) -> Result<IssuerCertificate> {
-        let bytes = fs::read(self.issuer_cert_path(certificate_id))?;
-        Ok(bincode::deserialize::<IssuerCertificate>(&bytes)?)
-    }
-
-    pub fn has_issuer_certificate(&self, certificate_id: &IssuerCertificateId) -> bool {
-        self.issuer_cert_path(certificate_id).exists()
     }
 
     pub fn lookup_by_hash(&self, asset_hash: &AssetHash) -> Result<Vec<String>> {
@@ -152,14 +115,6 @@ impl Storage {
         }
         let bytes = fs::read(path)?;
         Ok(bincode::deserialize::<ProofMetadata>(&bytes)?)
-    }
-
-    fn issuer_cert_dir(&self) -> PathBuf {
-        self.base_dir.join("issuer_certificates")
-    }
-
-    fn issuer_cert_path(&self, certificate_id: &IssuerCertificateId) -> PathBuf {
-        self.issuer_cert_dir().join(format!("{}.bin", certificate_id))
     }
 
     fn hash_index_path(&self) -> PathBuf {
