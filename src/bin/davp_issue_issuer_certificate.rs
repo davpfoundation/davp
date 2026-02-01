@@ -163,7 +163,7 @@ impl App {
         ui.text_edit_singleline(&mut self.issuer_public_key_base64);
 
         ui.add_space(8.0);
-        ui.label("metadata (optional JSON):");
+        ui.label("Metadata JSON*:");
         ui.add(
             egui::TextEdit::multiline(&mut self.metadata_json)
                 .desired_rows(4)

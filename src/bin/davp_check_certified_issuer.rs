@@ -1,12 +1,9 @@
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::Parser;
-use davp::modules::issuer_certificates::{
-    decode_ca_public_key_base64, evaluate_proof_certification, CertificateRepository,
-    ProofCertificationStatus,
+use davp::modules::issuer_certificate::{
+    fetch_certificate_bundle, verify_issuer_certificate, DEFAULT_CERTS_URL, IssuerCertificationStatus,
 };
-
-const DEFAULT_CERT_REPO_URL: &str = "https://davpframework.github.io/site/certs.json";
 
 #[derive(Parser, Debug)]
 #[command(name = "davp_check_certified_issuer")]
@@ -19,10 +16,10 @@ struct Cli {
     creator_public_key_base64: String,
 
     /// DAVP CA public key (base64)
-    #[arg(long)]
+    #[arg(long, default_value = "")]
     ca_public_key_base64: String,
 
-    #[arg(long, default_value = DEFAULT_CERT_REPO_URL)]
+    #[arg(long, default_value = DEFAULT_CERTS_URL)]
     cert_repo_url: String,
 }
 
@@ -34,60 +31,79 @@ fn decode_public_key_base64(s: &str) -> Result<[u8; 32]> {
     Ok(arr)
 }
 
+fn print_unverified() {
+    println!("unverified issuer");
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     if cli.issuer_certificate_id.trim().is_empty() {
-        println!("unverified issuer");
+        print_unverified();
         return Ok(());
     }
 
     let creator_pk = match decode_public_key_base64(&cli.creator_public_key_base64) {
         Ok(pk) => pk,
         Err(_) => {
-            println!("unverified issuer");
+            print_unverified();
             return Ok(());
         }
     };
 
-    let ca_pk = match decode_ca_public_key_base64(&cli.ca_public_key_base64) {
-        Ok(pk) => pk,
-        Err(_) => {
-            println!("unverified issuer");
-            return Ok(());
-        }
-    };
-
-    let repo = match CertificateRepository::load_from_url(&cli.cert_repo_url).await {
-        Ok(r) => r,
+    let bundle = match fetch_certificate_bundle(cli.cert_repo_url.trim()).await {
+        Ok(b) => b,
         Err(_) => {
             // network failures are non-fatal; treat as unverified
-            println!("unverified issuer");
+            print_unverified();
             return Ok(());
         }
     };
 
-    let repo_by_id = repo.index_by_id();
+    let ca_pk_b64_opt = {
+        let override_b64 = cli.ca_public_key_base64.trim();
+        if !override_b64.is_empty() {
+            Some(override_b64)
+        } else {
+            let cert = bundle
+                .certificates
+                .iter()
+                .find(|c| c.certificate_id.trim() == cli.issuer_certificate_id.trim());
+            cert.and_then(|c| c.ca_public_key_base64.as_deref())
+                .or(bundle.ca_public_key_base64.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        }
+    };
 
-    let status = evaluate_proof_certification(
-        Some(cli.issuer_certificate_id.trim()),
+    let Some(ca_pk_b64) = ca_pk_b64_opt else {
+        print_unverified();
+        return Ok(());
+    };
+    let ca_pk = match decode_public_key_base64(ca_pk_b64) {
+        Ok(pk) => pk,
+        Err(_) => {
+            print_unverified();
+            return Ok(());
+        }
+    };
+
+    let status = verify_issuer_certificate(
+        &bundle.certificates,
+        cli.issuer_certificate_id.trim(),
         &creator_pk,
-        Some(&repo_by_id),
-        Some(&ca_pk),
+        &ca_pk,
         chrono::Utc::now(),
-    );
+    )
+    .unwrap_or(IssuerCertificationStatus::Unverified);
 
     match status {
-        ProofCertificationStatus::CertifiedIssuer {
-            organization_name, ..
-        } => {
+        IssuerCertificationStatus::Certified { organization_name } => {
             println!("certified issuer");
             println!("organization_name={}", organization_name);
         }
-        _ => {
-            println!("unverified issuer");
-        }
+        IssuerCertificationStatus::Unverified => print_unverified(),
     }
 
     Ok(())

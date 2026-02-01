@@ -5,8 +5,8 @@ use davp::modules::certification::PublishedProof;
 use davp::modules::hash::blake3_hash_bytes;
 use davp::modules::bootstrap::{report_and_get_peers, PeerEntry, PeerReport};
 use davp::modules::issuer_certificate::{
-    DEFAULT_CERTS_URL, IssuerCertificationDetailed, IssuerCertificationStatus, fetch_certificate_bundle,
-    verify_issuer_certificate_detailed,
+    fetch_certificate_bundle, verify_issuer_certificate_detailed, IssuerCertificateBundle,
+    IssuerCertificationDetailed, DEFAULT_CERTS_URL,
 };
 use davp::modules::metadata::{AssetType, Metadata};
 use davp::modules::network::{
@@ -14,7 +14,6 @@ use davp::modules::network::{
     replicate_published_proof, replicate_proof,
     run_node_with_shutdown, NodeConfig, PeerConnections, ping_peer,
 };
-use davp_bootstrap_server::run_server_with_shutdown;
 use davp::modules::storage::Storage;
 use davp::modules::verification::verify_proof;
 use davp::KeypairBytes;
@@ -24,6 +23,8 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use std::time::SystemTime;
 use tokio::sync::watch;
 use tokio::sync::RwLock;
 
@@ -37,7 +38,6 @@ struct CntTrackerEntry {
 struct GuiSettingsFile {
     cnt_selected_addr: Option<String>,
     cnt_trackers: Vec<CntTrackerEntry>,
-    certs_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -141,6 +141,11 @@ struct DavpApp {
 
     certs_url: String,
     certs_last_fetch_status: String,
+    certs_bundle_cache: Option<IssuerCertificateBundle>,
+    certs_bundle_cache_at: Option<Instant>,
+
+    show_network_panel: bool,
+    show_about_window: bool,
 
     last_error: String,
 
@@ -204,6 +209,11 @@ impl Default for DavpApp {
 
             certs_url: DEFAULT_CERTS_URL.to_string(),
             certs_last_fetch_status: String::new(),
+            certs_bundle_cache: None,
+            certs_bundle_cache_at: None,
+
+            show_network_panel: true,
+            show_about_window: false,
 
             last_error: String::new(),
 
@@ -226,113 +236,90 @@ enum Tab {
 
 impl eframe::App for DavpApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Create, "Create");
-                ui.selectable_value(&mut self.tab, Tab::Verify, "Verify");
-                ui.selectable_value(&mut self.tab, Tab::Keygen, "Keygen");
-                ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
-            });
-
-            ui.separator();
-            ui.horizontal(|ui| {
-                if !self.networking_started {
-                    if ui.button("Start networking").clicked() {
-                        self.networking_started = true;
-                    }
-                } else {
-                    if ui.button("Disconnect network").clicked() {
-                        self.stop_network();
-                    }
-                }
-                ui.label(format!("Network: {}", if self.networking_started { "running" } else { "stopped" }));
-
-                if self.networking_started {
-                    let before = self.cnt_enabled;
-                    ui.checkbox(&mut self.cnt_enabled, "Use CNT tracker");
-                    if self.cnt_enabled != before {
-                        if let Some(tx) = &self.cnt_enabled_tx {
-                            let _ = tx.send(self.cnt_enabled);
+        egui::TopBottomPanel::top("top")
+            .resizable(false)
+            .show(ctx, |ui| {
+                egui::menu::bar(ui, |ui| {
+                    ui.menu_button("File", |ui| {
+                        if ui.button("Quit").clicked() {
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                         }
+                    });
 
-                        if !self.cnt_enabled {
-                            if let Ok(mut g) = self.bootstrap_entries.lock() {
-                                g.clear();
+                    ui.menu_button("View", |ui| {
+                        ui.checkbox(&mut self.show_network_panel, "Network panel");
+                    });
+
+                    ui.menu_button("Network", |ui| {
+                        if !self.networking_started {
+                            if ui.button("Start networking").clicked() {
+                                self.networking_started = true;
+                                self.show_network_panel = true;
                             }
+                        } else if ui.button("Disconnect network").clicked() {
+                            self.stop_network();
                         }
-                    }
-                }
 
-                if ui.button("Connect manually").clicked() {
-                    self.manual_connect_open = true;
-                }
-            });
+                        ui.separator();
+                        if ui.button("Connect manually...").clicked() {
+                            self.manual_connect_open = true;
+                        }
 
-            egui::CollapsingHeader::new("Network settings")
-                .default_open(true)
-                .show(ui, |ui| {
-                    ui.add_enabled_ui(!self.networking_started, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label("Node bind:");
-                            ui.text_edit_singleline(&mut self.node_bind);
-                            ui.label("Max peers:");
-                            ui.add(egui::DragValue::new(&mut self.max_peers).clamp_range(1..=100));
-                            ui.checkbox(&mut self.run_node_enabled, "Run node");
-                        });
+                        ui.separator();
+                        ui.add_enabled_ui(self.networking_started, |ui| {
+                            let before = self.cnt_enabled;
+                            ui.checkbox(&mut self.cnt_enabled, "Use CNT tracker");
+                            if self.cnt_enabled != before {
+                                if let Some(tx) = &self.cnt_enabled_tx {
+                                    let _ = tx.send(self.cnt_enabled);
+                                }
 
-                        let cnt_name = self
-                            .all_cnt_trackers()
-                            .into_iter()
-                            .find(|t| t.1 == self.cnt_selected_addr)
-                            .map(|t| t.0)
-                            .unwrap_or_else(|| "CNT World".to_string());
-                        ui.label(format!("CNT tracker: {} ({})", cnt_name, self.cnt_selected_addr));
-
-
-
-                        ui.horizontal(|ui| {
-                            ui.label("Manual seed peers (comma host:port):");
-                            ui.text_edit_singleline(&mut self.peers);
-                            if ui.button("Apply").clicked() {
-                                match parse_peers(&self.peers) {
-                                    Ok(list) => {
-                                        let peers_arc = Arc::clone(&self.peers_arc);
-                                        let _ = self.rt.block_on(async move {
-                                            *peers_arc.write().await = list;
-                                        });
+                                if !self.cnt_enabled {
+                                    if let Ok(mut g) = self.bootstrap_entries.lock() {
+                                        g.clear();
                                     }
-                                    Err(e) => self.last_error = e,
                                 }
                             }
-                            if ui.button("Sync").clicked() {
-                                let peers_arc = Arc::clone(&self.peers_arc);
-                                let snapshot = self
-                                    .rt
-                                    .block_on(async move { peers_arc.read().await.clone() });
-                                self.peers = snapshot
-                                    .iter()
-                                    .map(|p| p.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(",");
-                            }
                         });
-                    });
-                });
 
-            egui::CollapsingHeader::new("Storage settings")
-                .default_open(false)
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Storage dir:");
-                        ui.text_edit_singleline(&mut self.storage_dir);
-                        if ui.button("Browse").clicked() {
-                            if let Some(path) = rfd::FileDialog::new().pick_folder() {
-                                self.storage_dir = path.to_string_lossy().to_string();
-                            }
+                        ui.separator();
+                        if ui.button("Show network panel").clicked() {
+                            self.show_network_panel = true;
+                        }
+                    });
+
+                    ui.menu_button("Settings", |ui| {
+                        if ui.button("Open settings").clicked() {
+                            self.tab = Tab::Settings;
+                        }
+                    });
+
+                    ui.menu_button("Help", |ui| {
+                        if ui.button("About").clicked() {
+                            self.show_about_window = true;
                         }
                     });
                 });
-        });
+
+                ui.add_space(6.0);
+
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.tab, Tab::Create, "Create");
+                    ui.selectable_value(&mut self.tab, Tab::Verify, "Verify");
+                    ui.selectable_value(&mut self.tab, Tab::Keygen, "Keygen");
+                    ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
+
+                    ui.separator();
+                    ui.label(format!(
+                        "Network: {}",
+                        if self.networking_started { "running" } else { "stopped" }
+                    ));
+                    ui.label(format!(
+                        "CNT: {}",
+                        if self.cnt_enabled { "enabled" } else { "disabled" }
+                    ));
+                });
+            });
 
         let mut manual_connect_do_connect = false;
         let mut manual_connect_do_cancel = false;
@@ -369,111 +356,40 @@ impl eframe::App for DavpApp {
             self.manual_connect_open = false;
         }
 
+        if self.networking_started {
+            self.ensure_background_tasks();
+        }
+        if self.show_about_window {
+            self.ui_about_window(ctx);
+        }
+
+        if self.show_network_panel {
+            egui::SidePanel::right("network_panel")
+                .resizable(true)
+                .default_width(340.0)
+                .show(ctx, |ui| {
+                    self.ui_network_panel(ui);
+                });
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
-            if self.networking_started {
-                self.ensure_background_tasks();
-            }
-
-            let known_peers_snapshot = {
-                let peers_arc = Arc::clone(&self.peers_arc);
-                self.rt
-                    .block_on(async move { peers_arc.read().await.clone() })
-            };
-
-            let graph_snapshot = {
-                let peer_graph = Arc::clone(&self.peer_graph);
-                self.rt
-                    .block_on(async move { peer_graph.read().await.clone() })
-            };
-            let reachable_snapshot = self
-                .reachable_peers
-                .lock()
-                .map(|g| g.clone())
-                .unwrap_or_default();
-
-            let entries = self
-                .bootstrap_entries
-                .lock()
-                .map(|g| g.clone())
-                .unwrap_or_default();
-
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label(format!("Known peers: {}", known_peers_snapshot.len()));
-                ui.label(format!("Reachable peers: {}", reachable_snapshot.len()));
-                ui.label(format!("CNT peers: {}", entries.len()));
-                ui.label(format!("CNT tracker: {}", if self.cnt_enabled { "enabled" } else { "disabled" }));
-            });
-
-            egui::CollapsingHeader::new("Reachable peers (ping OK)")
-                .default_open(true)
-                .show(ui, |ui| {
-                    for p in reachable_snapshot {
-                        ui.monospace(p.to_string());
-                    }
-                });
-
-            egui::CollapsingHeader::new("Known peers (cached list)")
-                .default_open(false)
-                .show(ui, |ui| {
-                    for p in known_peers_snapshot {
-                        ui.monospace(p.to_string());
-                    }
-                });
-
-            egui::CollapsingHeader::new("Connection graph (gossip)")
-                .default_open(false)
-                .show(ui, |ui| {
-                    let mut keys: Vec<_> = graph_snapshot.keys().copied().collect();
-                    keys.sort_by_key(|k| k.to_string());
-                    for k in keys {
-                        let mut peers = graph_snapshot.get(&k).cloned().unwrap_or_default();
-                        peers.sort_by_key(|p| p.to_string());
-                        ui.monospace(format!(
-                            "{} -> {}",
-                            k,
-                            peers
-                                .iter()
-                                .map(|p| p.to_string())
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        ));
-                    }
-                });
-
-            if !entries.is_empty() {
-                egui::CollapsingHeader::new("CNT peers (tracker list)")
-                    .default_open(false)
-                    .show(ui, |ui| {
-                        let now = chrono::Utc::now();
-                        for e in entries {
-                            let expires_in = (e.expires_at - now).num_seconds();
-                            ui.monospace(format!(
-                                "{} last_seen={} expires_in={}s reported_connected={} reported_known={} ",
-                                e.addr,
-                                e.last_seen.to_rfc3339(),
-                                expires_in,
-                                e.connected_peers.len(),
-                                e.known_peers.len()
-                            ));
+            if !self.last_error.is_empty() {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(egui::Color32::RED, &self.last_error);
+                        if ui.button("Clear").clicked() {
+                            self.last_error.clear();
                         }
                     });
-            }
-
-            if !self.last_error.is_empty() {
-                ui.add_space(4.0);
-                ui.colored_label(egui::Color32::RED, &self.last_error);
-                if ui.button("Clear error").clicked() {
-                    self.last_error.clear();
-                }
-                ui.separator();
+                });
+                ui.add_space(10.0);
             }
 
             match self.tab {
                 Tab::Create => self.ui_create(ui),
                 Tab::Verify => self.ui_verify(ui),
                 Tab::Keygen => self.ui_keygen(ui),
-                Tab::Settings => self.ui_settings(ui),
+                Tab::Settings => self.ui_settings_tab(ui),
             }
         });
     }
@@ -488,6 +404,10 @@ impl DavpApp {
         v
     }
 
+    fn all_certs_sources(&self) -> Vec<(String, String)> {
+        vec![("DAVP World".to_string(), DEFAULT_CERTS_URL.to_string())]
+    }
+
     fn settings_path(&self) -> PathBuf {
         PathBuf::from(self.storage_dir.trim()).join("gui_settings.json")
     }
@@ -497,6 +417,7 @@ impl DavpApp {
         let Ok(bytes) = std::fs::read(&path) else {
             self.cnt_selected_addr = "127.0.0.1:9100".to_string();
             self.cnt_server = self.cnt_selected_addr.clone();
+            self.certs_url = DEFAULT_CERTS_URL.to_string();
             return;
         };
         let Ok(s) = String::from_utf8(bytes) else {
@@ -507,6 +428,7 @@ impl DavpApp {
         let Ok(settings) = serde_json::from_str::<GuiSettingsFile>(&s) else {
             self.cnt_selected_addr = "127.0.0.1:9100".to_string();
             self.cnt_server = self.cnt_selected_addr.clone();
+            self.certs_url = DEFAULT_CERTS_URL.to_string();
             return;
         };
         self.cnt_trackers = settings.cnt_trackers;
@@ -525,12 +447,7 @@ impl DavpApp {
         }
         self.cnt_server = self.cnt_selected_addr.clone();
 
-        if let Some(url) = settings.certs_url {
-            let url = url.trim().to_string();
-            if !url.is_empty() {
-                self.certs_url = url;
-            }
-        }
+        self.certs_url = DEFAULT_CERTS_URL.to_string();
     }
 
     fn save_gui_settings(&self) -> std::result::Result<(), String> {
@@ -540,127 +457,293 @@ impl DavpApp {
         let settings = GuiSettingsFile {
             cnt_selected_addr: Some(self.cnt_selected_addr.clone()),
             cnt_trackers: self.cnt_trackers.clone(),
-            certs_url: Some(self.certs_url.clone()),
         };
         let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
         std::fs::write(&path, json).map_err(|e| e.to_string())?;
         Ok(())
     }
 
-    fn ui_settings(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Settings");
-        ui.add_space(8.0);
-
-        ui.add_enabled_ui(!self.networking_started, |ui| {
-            ui.label("Issuer certificates URL:");
-            ui.text_edit_singleline(&mut self.certs_url);
-            if ui.button("Save").clicked() {
-                if self.certs_url.trim().is_empty() {
-                    self.last_error = "certs URL cannot be empty".to_string();
-                } else if let Err(e) = self.save_gui_settings() {
-                    self.last_error = e;
+    fn ui_settings_tab(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.heading("Certificates");
+                let sources = self.all_certs_sources();
+                let mut selected = sources
+                    .iter()
+                    .position(|(_, url)| url.trim() == self.certs_url.trim())
+                    .unwrap_or(0);
+                egui::ComboBox::from_id_source("certs_source_select")
+                    .selected_text(format!("{}", sources[selected].0))
+                    .show_ui(ui, |ui| {
+                        for (i, (name, _)) in sources.iter().enumerate() {
+                            ui.selectable_value(&mut selected, i, name);
+                        }
+                    });
+                self.certs_url = sources[selected].1.clone();
+                ui.horizontal(|ui| {
+                    if ui.button("Refresh certs").clicked() {
+                        let _ = self.fetch_certs_bundle_for_verify(true);
+                    }
+                });
+                if !self.certs_last_fetch_status.is_empty() {
+                    ui.monospace(&self.certs_last_fetch_status);
                 }
-            }
+            });
 
-            ui.add_space(10.0);
-            ui.separator();
-            ui.label("CNT tracker:");
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.heading("CNT trackers");
 
-            let trackers = self.all_cnt_trackers();
-            let mut selected = trackers
-                .iter()
-                .position(|(_, addr)| addr.trim() == self.cnt_selected_addr.trim())
-                .unwrap_or(0);
+                ui.add_enabled_ui(!self.networking_started, |ui| {
+                    let trackers = self.all_cnt_trackers();
+                    let mut selected = trackers
+                        .iter()
+                        .position(|(_, addr)| addr.trim() == self.cnt_selected_addr.trim())
+                        .unwrap_or(0);
 
-            egui::ComboBox::from_id_source("cnt_tracker_select")
-                .selected_text(format!("{} ({})", trackers[selected].0, trackers[selected].1))
-                .show_ui(ui, |ui: &mut egui::Ui| {
-                    for (i, (name, addr)) in trackers.iter().enumerate() {
-                        ui.selectable_value(&mut selected, i, format!("{} ({})", name, addr));
+                    egui::ComboBox::from_id_source("cnt_tracker_select")
+                        .selected_text(format!(
+                            "{} ({})",
+                            trackers[selected].0,
+                            trackers[selected].1
+                        ))
+                        .show_ui(ui, |ui: &mut egui::Ui| {
+                            for (i, (name, addr)) in trackers.iter().enumerate() {
+                                ui.selectable_value(
+                                    &mut selected,
+                                    i,
+                                    format!("{} ({})", name, addr),
+                                );
+                            }
+                        });
+
+                    let new_addr = trackers
+                        .get(selected)
+                        .map(|t| t.1.clone())
+                        .unwrap_or_else(|| "127.0.0.1:9100".to_string());
+                    if new_addr.trim() != self.cnt_selected_addr.trim() {
+                        self.cnt_selected_addr = new_addr;
+                        self.cnt_server = self.cnt_selected_addr.clone();
+                        if let Err(e) = self.save_gui_settings() {
+                            self.last_error = e;
+                        }
+                    }
+
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.label("Add custom CNT tracker");
+                    ui.horizontal(|ui| {
+                        ui.label("Name");
+                        ui.text_edit_singleline(&mut self.cnt_new_name);
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Addr (host:port)");
+                        ui.text_edit_singleline(&mut self.cnt_new_addr);
+                    });
+                    if ui.button("Add").clicked() {
+                        let name = self.cnt_new_name.trim().to_string();
+                        let addr = self.cnt_new_addr.trim().to_string();
+                        if name.is_empty() {
+                            self.last_error = "tracker name cannot be empty".to_string();
+                        } else if addr.is_empty() {
+                            self.last_error = "tracker addr cannot be empty".to_string();
+                        } else if addr.parse::<SocketAddr>().is_err() {
+                            self.last_error = "tracker addr must be host:port".to_string();
+                        } else if self
+                            .all_cnt_trackers()
+                            .iter()
+                            .any(|(_, a)| a.trim() == addr.trim())
+                        {
+                            self.last_error = "tracker addr already exists".to_string();
+                        } else {
+                            self.cnt_trackers.push(CntTrackerEntry {
+                                name,
+                                addr: addr.clone(),
+                            });
+                            self.cnt_selected_addr = addr;
+                            self.cnt_server = self.cnt_selected_addr.clone();
+                            self.cnt_new_name.clear();
+                            self.cnt_new_addr.clear();
+                            if let Err(e) = self.save_gui_settings() {
+                                self.last_error = e;
+                            }
+                        }
+                    }
+
+                    if !self.cnt_trackers.is_empty() {
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.label("Custom CNT trackers");
+                        let mut remove_addr: Option<String> = None;
+                        for t in &self.cnt_trackers {
+                            ui.horizontal(|ui| {
+                                ui.monospace(format!("{} ({})", t.name, t.addr));
+                                if ui.button("Remove").clicked() {
+                                    remove_addr = Some(t.addr.clone());
+                                }
+                            });
+                        }
+                        if let Some(addr) = remove_addr {
+                            self.cnt_trackers.retain(|t| t.addr.trim() != addr.trim());
+                            if self.cnt_selected_addr.trim() == addr.trim() {
+                                self.cnt_selected_addr = "127.0.0.1:9100".to_string();
+                                self.cnt_server = self.cnt_selected_addr.clone();
+                            }
+                            if let Err(e) = self.save_gui_settings() {
+                                self.last_error = e;
+                            }
+                        }
                     }
                 });
 
-            let new_addr = trackers
-                .get(selected)
-                .map(|t| t.1.clone())
-                .unwrap_or_else(|| "127.0.0.1:9100".to_string());
-            if new_addr.trim() != self.cnt_selected_addr.trim() {
-                self.cnt_selected_addr = new_addr;
-                self.cnt_server = self.cnt_selected_addr.clone();
-                if let Err(e) = self.save_gui_settings() {
-                    self.last_error = e;
+                if self.networking_started {
+                    ui.add_space(6.0);
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        "Stop networking to change CNT tracker settings.",
+                    );
                 }
-            }
-
-            ui.add_space(10.0);
-            ui.separator();
-            ui.label("Add custom CNT tracker:");
-            ui.horizontal(|ui| {
-                ui.label("Name:");
-                ui.text_edit_singleline(&mut self.cnt_new_name);
             });
-            ui.horizontal(|ui| {
-                ui.label("Addr (host:port):");
-                ui.text_edit_singleline(&mut self.cnt_new_addr);
-            });
-            if ui.button("Add tracker").clicked() {
-                let name = self.cnt_new_name.trim().to_string();
-                let addr = self.cnt_new_addr.trim().to_string();
-                if name.is_empty() {
-                    self.last_error = "tracker name cannot be empty".to_string();
-                } else if addr.is_empty() {
-                    self.last_error = "tracker addr cannot be empty".to_string();
-                } else if addr.parse::<SocketAddr>().is_err() {
-                    self.last_error = "tracker addr must be host:port".to_string();
-                } else if self.all_cnt_trackers().iter().any(|(_, a)| a.trim() == addr.trim()) {
-                    self.last_error = "tracker addr already exists".to_string();
-                } else {
-                    self.cnt_trackers.push(CntTrackerEntry { name, addr: addr.clone() });
-                    self.cnt_selected_addr = addr;
-                    self.cnt_server = self.cnt_selected_addr.clone();
-                    self.cnt_new_name.clear();
-                    self.cnt_new_addr.clear();
-                    if let Err(e) = self.save_gui_settings() {
-                        self.last_error = e;
-                    }
-                }
-            }
-
-            if !self.cnt_trackers.is_empty() {
-                ui.add_space(10.0);
-                ui.separator();
-                ui.label("Custom CNT trackers:");
-                let mut remove_addr: Option<String> = None;
-                for t in &self.cnt_trackers {
-                    ui.horizontal(|ui| {
-                        ui.monospace(format!("{} ({})", t.name, t.addr));
-                        if ui.button("Remove").clicked() {
-                            remove_addr = Some(t.addr.clone());
-                        }
-                    });
-                }
-                if let Some(addr) = remove_addr {
-                    self.cnt_trackers.retain(|t| t.addr.trim() != addr.trim());
-                    if self.cnt_selected_addr.trim() == addr.trim() {
-                        self.cnt_selected_addr = "127.0.0.1:9100".to_string();
-                        self.cnt_server = self.cnt_selected_addr.clone();
-                    }
-                    if let Err(e) = self.save_gui_settings() {
-                        self.last_error = e;
-                    }
-                }
-            }
         });
-
-        if self.networking_started {
-            ui.add_space(6.0);
-            ui.colored_label(egui::Color32::YELLOW, "Stop networking to change CNT tracker settings.");
-        }
     }
 
+    fn ui_about_window(&mut self, ctx: &egui::Context) {
+        egui::Window::new("About")
+            .open(&mut self.show_about_window)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.heading("davp");
+                ui.add_space(6.0);
+                ui.monospace(format!(
+                    "build_time={}",
+                    SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .map(|d| d.as_secs().to_string())
+                        .unwrap_or_else(|_| "unknown".to_string())
+                ));
+                ui.add_space(6.0);
+                ui.label("Certificate verification uses certs.json from Settings.");
+            });
+    }
+
+    fn ui_network_panel(&mut self, ui: &mut egui::Ui) {
+        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.heading("Network");
+                ui.horizontal(|ui| {
+                    if !self.networking_started {
+                        if ui.button("Start").clicked() {
+                            self.networking_started = true;
+                        }
+                    } else if ui.button("Disconnect").clicked() {
+                        self.stop_network();
+                    }
+
+                    if ui.button("Connect...").clicked() {
+                        self.manual_connect_open = true;
+                    }
+                });
+
+                ui.add_enabled_ui(self.networking_started, |ui| {
+                    ui.checkbox(&mut self.cnt_enabled, "CNT");
+                    if let Some(tx) = &self.cnt_enabled_tx {
+                        let _ = tx.send(self.cnt_enabled);
+                    }
+                });
+            });
+
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.heading("Config");
+                ui.add_enabled_ui(!self.networking_started, |ui| {
+                    ui.label("Node bind");
+                    ui.text_edit_singleline(&mut self.node_bind);
+                    ui.horizontal(|ui| {
+                        ui.label("Max peers");
+                        ui.add(egui::DragValue::new(&mut self.max_peers).clamp_range(1..=100));
+                        ui.checkbox(&mut self.run_node_enabled, "Run node");
+                    });
+
+                    let cnt_name = self
+                        .all_cnt_trackers()
+                        .into_iter()
+                        .find(|t| t.1 == self.cnt_selected_addr)
+                        .map(|t| t.0)
+                        .unwrap_or_else(|| "CNT World".to_string());
+                    ui.label(format!("CNT tracker: {}", cnt_name));
+                    ui.label(&self.cnt_selected_addr);
+
+                    ui.label("Seed peers");
+                    ui.text_edit_singleline(&mut self.peers);
+                    ui.horizontal(|ui| {
+                        if ui.button("Apply").clicked() {
+                            match parse_peers(&self.peers) {
+                                Ok(list) => {
+                                    let peers_arc = Arc::clone(&self.peers_arc);
+                                    let _ = self.rt.block_on(async move {
+                                        *peers_arc.write().await = list;
+                                    });
+                                }
+                                Err(e) => self.last_error = e,
+                            }
+                        }
+                        if ui.button("Sync").clicked() {
+                            let peers_arc = Arc::clone(&self.peers_arc);
+                            let snapshot =
+                                self.rt.block_on(async move { peers_arc.read().await.clone() });
+                            self.peers = snapshot
+                                .iter()
+                                .map(|p| p.to_string())
+                                .collect::<Vec<_>>()
+                                .join(",");
+                        }
+                    });
+                });
+            });
+
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.heading("Status");
+                let known_peers_snapshot = {
+                    let peers_arc = Arc::clone(&self.peers_arc);
+                    self.rt
+                        .block_on(async move { peers_arc.read().await.clone() })
+                };
+                let reachable_snapshot = self
+                    .reachable_peers
+                    .lock()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+                let entries = self
+                    .bootstrap_entries
+                    .lock()
+                    .map(|g| g.clone())
+                    .unwrap_or_default();
+
+                ui.label(format!("Known: {}", known_peers_snapshot.len()));
+                ui.label(format!("Reachable: {}", reachable_snapshot.len()));
+                ui.label(format!("CNT peers: {}", entries.len()));
+            });
+        });
+    }
+}
+
+impl DavpApp {
     fn fetch_certs_bundle_for_verify(
         &mut self,
-    ) -> std::result::Result<davp::modules::issuer_certificate::IssuerCertificateBundle, String> {
+        force_refresh: bool,
+    ) -> std::result::Result<IssuerCertificateBundle, String> {
+        let ttl = Duration::from_secs(60);
+        if !force_refresh {
+            if let (Some(bundle), Some(at)) = (&self.certs_bundle_cache, self.certs_bundle_cache_at) {
+                if at.elapsed() <= ttl {
+                    self.certs_last_fetch_status = format!(
+                        "using cached {} certificate(s)",
+                        bundle.certificates.len()
+                    );
+                    return Ok(bundle.clone());
+                }
+            }
+        }
+
         let url = if self.certs_url.trim().is_empty() {
             DEFAULT_CERTS_URL
         } else {
@@ -679,6 +762,8 @@ impl DavpApp {
                     b.certificates.len(),
                     url
                 );
+                self.certs_bundle_cache = Some(b.clone());
+                self.certs_bundle_cache_at = Some(Instant::now());
             }
             Err(e) => {
                 self.certs_last_fetch_status = format!("failed to fetch {}: {}", url, e);
@@ -686,6 +771,56 @@ impl DavpApp {
         }
 
         res
+    }
+
+    fn issuer_certification(
+        &mut self,
+        issuer_certificate_id: &str,
+        proof_creator_public_key: &[u8; 32],
+    ) -> (IssuerCertificationDetailed, Option<String>) {
+        let bundle = match self.fetch_certs_bundle_for_verify(false) {
+            Ok(b) => b,
+            Err(e) => {
+                return (
+                    IssuerCertificationDetailed::NotFound,
+                    Some(format!("failed to fetch certs.json: {}", e)),
+                );
+            }
+        };
+
+        let ca_b64 = bundle
+            .certificates
+            .iter()
+            .find(|c| c.certificate_id.trim() == issuer_certificate_id.trim())
+            .and_then(|c| c.ca_public_key_base64.as_deref())
+            .or(bundle.ca_public_key_base64.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .or_else(|| std::env::var("DAVP_CA_PUBLIC_KEY_BASE64").ok());
+
+        let Some(ca_b64) = ca_b64 else {
+            return (IssuerCertificationDetailed::InvalidCaSignature, None);
+        };
+
+        let ca_pk_bytes = base64::engine::general_purpose::STANDARD
+            .decode(ca_b64.trim())
+            .ok();
+        let ca_pk: Option<[u8; 32]> = ca_pk_bytes.and_then(|b| b.try_into().ok());
+        let Some(ca_pk) = ca_pk else {
+            return (IssuerCertificationDetailed::InvalidCaSignature, None);
+        };
+
+        let detailed = verify_issuer_certificate_detailed(
+            &bundle.certificates,
+            issuer_certificate_id,
+            proof_creator_public_key,
+            &ca_pk,
+            chrono::Utc::now(),
+        )
+        .unwrap_or(IssuerCertificationDetailed::InvalidCaSignature);
+
+        (detailed, None)
     }
 }
 
@@ -906,196 +1041,259 @@ impl DavpApp {
     }
 
     fn ui_keygen(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Keygen");
-        ui.add_space(8.0);
+        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+            ui.heading("Keygen");
 
-        if ui.button("Generate new keypair").clicked() {
-            match self.keygen() {
-                Ok(()) => {}
-                Err(e) => self.last_error = e,
-            }
-        }
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("Generate new keypair").clicked() {
+                        match self.keygen() {
+                            Ok(()) => {}
+                            Err(e) => self.last_error = e,
+                        }
+                    }
+                    if ui.button("Copy public key").clicked() {
+                        ui.output_mut(|o| o.copied_text = self.public_key_base64.clone());
+                    }
+                });
+            });
 
-        ui.add_space(8.0);
-        ui.label("Keypair (base64) - keep private:");
-        ui.text_edit_multiline(&mut self.keypair_base64);
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.label("Keypair (base64)");
+                ui.add(egui::TextEdit::multiline(&mut self.keypair_base64));
+            });
 
-        ui.label("Public key (base64) - shareable:");
-        ui.text_edit_multiline(&mut self.public_key_base64);
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.label("Public key (base64)");
+                ui.add(egui::TextEdit::multiline(&mut self.public_key_base64));
+            });
+        });
     }
 
     fn ui_create(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Create Proof");
-        ui.add_space(8.0);
+        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+            ui.heading("Create Proof");
 
-        ui.horizontal(|ui| {
-            ui.label("File:");
-            ui.text_edit_singleline(&mut self.create_file_path);
-            if ui.button("Browse").clicked() {
-                if let Some(path) = rfd::FileDialog::new().pick_file() {
-                    self.create_file_path = path.to_string_lossy().to_string();
-                }
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.heading("Inputs");
+                ui.horizontal(|ui| {
+                    ui.label("File");
+                    ui.text_edit_singleline(&mut self.create_file_path);
+                    if ui.button("Browse").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().pick_file() {
+                            self.create_file_path = path.to_string_lossy().to_string();
+                        }
+                    }
+                });
+
+                ui.horizontal(|ui| {
+                    ui.label("Asset type");
+                    if self.create_asset_type.is_empty() {
+                        self.create_asset_type = "other".to_string();
+                    }
+                    egui::ComboBox::from_id_source("asset_type")
+                        .selected_text(self.create_asset_type.clone())
+                        .show_ui(ui, |ui| {
+                            for t in ["other", "text", "image", "video", "audio", "code"] {
+                                ui.selectable_value(&mut self.create_asset_type, t.to_string(), t);
+                            }
+                        });
+                    ui.checkbox(&mut self.create_ai_assisted, "AI assisted");
+                });
+            });
+
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.heading("Metadata");
+                ui.label("Description");
+                ui.text_edit_multiline(&mut self.create_description);
+                ui.label("Tags (comma-separated)");
+                ui.text_edit_singleline(&mut self.create_tags);
+                ui.label("Parent verification_id*");
+                ui.text_edit_singleline(&mut self.create_parent_verification_id);
+                ui.label("Issuer certificate id*");
+                ui.text_edit_singleline(&mut self.create_issuer_certificate_id);
+            });
+
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.heading("Signing");
+                ui.label("Keypair (base64)");
+                ui.text_edit_multiline(&mut self.keypair_base64);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Create proof").clicked() {
+                            match self.create_proof() {
+                                Ok(()) => {}
+                                Err(e) => self.last_error = e,
+                            }
+                        }
+                    });
+                });
+            });
+
+            if !self.created_verification_id.is_empty() {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.heading("Output");
+
+                    ui.horizontal(|ui| {
+                        ui.label("verification_id");
+                        ui.monospace(&self.created_verification_id);
+                        if ui.button("Copy").clicked() {
+                            ui.output_mut(|o| o.copied_text = self.created_verification_id.clone());
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("creator_public_key");
+                        ui.monospace(&self.created_creator_public_key_base64);
+                        if ui.button("Copy").clicked() {
+                            ui.output_mut(|o| o.copied_text = self.created_creator_public_key_base64.clone());
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("signature");
+                        ui.monospace(&self.created_signature_base64);
+                        if ui.button("Copy").clicked() {
+                            ui.output_mut(|o| o.copied_text = self.created_signature_base64.clone());
+                        }
+                    });
+                    if !self.created_issuer_certificate_id_display.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.label("issuer_certificate_id");
+                            ui.monospace(&self.created_issuer_certificate_id_display);
+                            if ui.button("Copy").clicked() {
+                                ui.output_mut(|o| {
+                                    o.copied_text = self.created_issuer_certificate_id_display.clone()
+                                });
+                            }
+                        });
+                    }
+                });
             }
         });
-
-        ui.horizontal(|ui| {
-            ui.label("Asset type:");
-            ui.text_edit_singleline(&mut self.create_asset_type);
-            if self.create_asset_type.is_empty() {
-                self.create_asset_type = "other".to_string();
-            }
-        });
-
-        ui.checkbox(&mut self.create_ai_assisted, "AI assisted");
-
-        ui.label("Description:");
-        ui.text_edit_multiline(&mut self.create_description);
-
-        ui.label("Tags (comma-separated):");
-        ui.text_edit_singleline(&mut self.create_tags);
-
-        ui.label("Parent verification_id (optional):");
-        ui.text_edit_singleline(&mut self.create_parent_verification_id);
-
-        ui.label("Issuer certificate id (optional):");
-        ui.text_edit_singleline(&mut self.create_issuer_certificate_id);
-
-        ui.add_space(8.0);
-        ui.label("Keypair (base64):");
-        ui.text_edit_multiline(&mut self.keypair_base64);
-
-        ui.add_space(8.0);
-        if ui.button("Create proof").clicked() {
-            match self.create_proof() {
-                Ok(()) => {}
-                Err(e) => self.last_error = e,
-            }
-        }
-
-        if !self.created_verification_id.is_empty() {
-            ui.separator();
-            ui.label("Created verification_id:");
-            ui.monospace(&self.created_verification_id);
-
-            ui.label("Creator public key (base64):");
-            ui.monospace(&self.created_creator_public_key_base64);
-
-            ui.label("Signature (base64):");
-            ui.monospace(&self.created_signature_base64);
-
-            if !self.created_issuer_certificate_id_display.is_empty() {
-                ui.label("Issuer certificate id:");
-                ui.monospace(&self.created_issuer_certificate_id_display);
-            }
-        }
     }
 
     fn ui_verify(&mut self, ui: &mut egui::Ui) {
-        ui.heading("Verify Proof");
-        ui.add_space(8.0);
+        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+            ui.heading("Verify Proof");
 
-        ui.label("verification_id:");
-        ui.text_edit_singleline(&mut self.verify_verification_id);
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.heading("Inputs");
+                ui.label("verification_id");
+                ui.text_edit_singleline(&mut self.verify_verification_id);
 
-        ui.horizontal(|ui| {
-            ui.label("File (optional):");
-            ui.text_edit_singleline(&mut self.verify_file_path);
-            if ui.button("Browse").clicked() {
-                if let Some(path) = rfd::FileDialog::new().pick_file() {
-                    self.verify_file_path = path.to_string_lossy().to_string();
-                }
-            }
-        });
-
-        if ui.button("Verify").clicked() {
-            match self.verify() {
-                Ok(()) => {}
-                Err(e) => self.last_error = e,
-            }
-        }
-
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label("certs_url:");
-            ui.monospace(self.certs_url.trim());
-            if ui.button("Refresh certs").clicked() {
-                let _ = self.fetch_certs_bundle_for_verify();
-            }
-        });
-        if !self.certs_last_fetch_status.is_empty() {
-            ui.monospace(&self.certs_last_fetch_status);
-        }
-
-        ui.add_space(6.0);
-        ui.label("Tip: leave verification_id empty to verify by file only (it will compute hash and search peers/local index).");
-
-        if let Some(v) = &self.verify_view {
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label("Result:");
-                ui.colored_label(egui::Color32::GREEN, "valid");
-            });
-
-            ui.horizontal(|ui| {
-                ui.label("verification_id:");
-                ui.monospace(&v.verification_id);
-                if ui.button("Copy").clicked() {
-                    ui.output_mut(|o| o.copied_text = v.verification_id.clone());
-                }
-            });
-
-            ui.horizontal(|ui| {
-                ui.label("creator_public_key:");
-                ui.monospace(&v.creator_public_key_base64);
-                if ui.button("Copy").clicked() {
-                    ui.output_mut(|o| o.copied_text = v.creator_public_key_base64.clone());
-                }
-            });
-
-            ui.horizontal(|ui| {
-                ui.label("signature:");
-                ui.monospace(&v.signature_base64);
-                if ui.button("Copy").clicked() {
-                    ui.output_mut(|o| o.copied_text = v.signature_base64.clone());
-                }
-            });
-
-            if let Some(id) = &v.issuer_certificate_id {
                 ui.horizontal(|ui| {
-                    ui.label("issuer_certificate_id:");
-                    ui.monospace(id);
-                    if ui.button("Copy").clicked() {
-                        ui.output_mut(|o| o.copied_text = id.clone());
+                    ui.label("File*");
+                    ui.text_edit_singleline(&mut self.verify_file_path);
+                    if ui.button("Browse").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().pick_file() {
+                            self.verify_file_path = path.to_string_lossy().to_string();
+                        }
                     }
                 });
-                if v.issuer_certified {
-                    if let Some(org) = &v.organization_name {
-                        ui.colored_label(egui::Color32::GREEN, format!("certified issuer: {}", org));
-                    } else {
-                        ui.colored_label(egui::Color32::GREEN, "certified issuer");
-                    }
-                } else {
-                    ui.colored_label(egui::Color32::YELLOW, "unverified issuer");
-                    if let Some(r) = &v.issuer_unverified_reason {
-                        ui.monospace(r);
-                    }
-                }
-            } else {
-                ui.colored_label(egui::Color32::YELLOW, "unverified issuer");
-            }
 
-            egui::CollapsingHeader::new("Raw status")
-                .default_open(false)
-                .show(ui, |ui| {
-                    if !self.verify_status.is_empty() {
-                        ui.monospace(&self.verify_status);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Verify").clicked() {
+                            match self.verify() {
+                                Ok(()) => {}
+                                Err(e) => self.last_error = e,
+                            }
+                        }
+                    });
+                });
+            });
+
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.heading("Certificates");
+                ui.horizontal(|ui| {
+                    ui.label("certs_url");
+                    ui.monospace(self.certs_url.trim());
+                    if ui.button("Refresh").clicked() {
+                        let _ = self.fetch_certs_bundle_for_verify(true);
+                    }
+                    if ui.button("Settings").clicked() {
+                        self.tab = Tab::Settings;
                     }
                 });
-        } else if !self.verify_status.is_empty() {
-            ui.separator();
-            ui.label("Status:");
-            ui.monospace(&self.verify_status);
-        }
+                if !self.certs_last_fetch_status.is_empty() {
+                    ui.monospace(&self.certs_last_fetch_status);
+                }
+            });
+
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.heading("Result");
+
+                if let Some(v) = &self.verify_view {
+                    ui.horizontal(|ui| {
+                        ui.label("status");
+                        ui.colored_label(egui::Color32::GREEN, "valid");
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("verification_id");
+                        ui.monospace(&v.verification_id);
+                        if ui.button("Copy").clicked() {
+                            ui.output_mut(|o| o.copied_text = v.verification_id.clone());
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("creator_public_key");
+                        ui.monospace(&v.creator_public_key_base64);
+                        if ui.button("Copy").clicked() {
+                            ui.output_mut(|o| o.copied_text = v.creator_public_key_base64.clone());
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label("signature");
+                        ui.monospace(&v.signature_base64);
+                        if ui.button("Copy").clicked() {
+                            ui.output_mut(|o| o.copied_text = v.signature_base64.clone());
+                        }
+                    });
+
+                    if let Some(id) = &v.issuer_certificate_id {
+                        ui.horizontal(|ui| {
+                            ui.label("issuer_certificate_id");
+                            ui.monospace(id);
+                            if ui.button("Copy").clicked() {
+                                ui.output_mut(|o| o.copied_text = id.clone());
+                            }
+                        });
+                        if v.issuer_certified {
+                            if let Some(org) = &v.organization_name {
+                                ui.colored_label(
+                                    egui::Color32::GREEN,
+                                    format!("certified issuer: {}", org),
+                                );
+                            } else {
+                                ui.colored_label(egui::Color32::GREEN, "certified issuer");
+                            }
+                        } else {
+                            ui.colored_label(egui::Color32::YELLOW, "unverified issuer");
+                            if let Some(r) = &v.issuer_unverified_reason {
+                                ui.monospace(r);
+                            }
+                        }
+                    } else {
+                        ui.colored_label(egui::Color32::YELLOW, "unverified issuer");
+                    }
+
+                    egui::CollapsingHeader::new("Raw status")
+                        .default_open(false)
+                        .show(ui, |ui| {
+                            if !self.verify_status.is_empty() {
+                                ui.monospace(&self.verify_status);
+                            }
+                        });
+                } else if !self.verify_status.is_empty() {
+                    ui.label("Status");
+                    ui.monospace(&self.verify_status);
+                } else {
+                    ui.label("No result yet.");
+                }
+            });
+        });
     }
 
     fn keygen(&mut self) -> std::result::Result<(), String> {
@@ -1247,49 +1445,8 @@ impl DavpApp {
                     if let Some(id) = published.issuer_certificate_id.as_deref() {
                         status.push_str(&format!("issuer_certificate_id={}\n", id));
 
-                        let (cert_detailed, fetch_err_reason) = match self.fetch_certs_bundle_for_verify() {
-                            Ok(bundle) => {
-                                let ca_b64 = bundle
-                                    .certificates
-                                    .iter()
-                                    .find(|c| c.certificate_id.trim() == id.trim())
-                                    .and_then(|c| c.ca_public_key_base64.as_deref())
-                                    .or(bundle.ca_public_key_base64.as_deref())
-                                    .map(str::trim)
-                                    .filter(|s| !s.is_empty())
-                                    .map(|s| s.to_string())
-                                    .or_else(|| std::env::var("DAVP_CA_PUBLIC_KEY_BASE64").ok());
-
-                                match ca_b64 {
-                                    Some(ca_b64) => {
-                                        let ca_pk_bytes = base64::engine::general_purpose::STANDARD
-                                            .decode(ca_b64.trim())
-                                            .ok();
-                                        let ca_pk: Option<[u8; 32]> =
-                                            ca_pk_bytes.and_then(|b| b.try_into().ok());
-                                        match ca_pk {
-                                            Some(ca_pk) => {
-                                                let detailed = verify_issuer_certificate_detailed(
-                                                    &bundle.certificates,
-                                                    id,
-                                                    &published.proof.creator_public_key,
-                                                    &ca_pk,
-                                                    chrono::Utc::now(),
-                                                )
-                                                .unwrap_or(IssuerCertificationDetailed::InvalidCaSignature);
-                                                (detailed, None)
-                                            }
-                                            None => (IssuerCertificationDetailed::InvalidCaSignature, None),
-                                        }
-                                    }
-                                    None => (IssuerCertificationDetailed::InvalidCaSignature, None),
-                                }
-                            }
-                            Err(e) => (
-                                IssuerCertificationDetailed::NotFound,
-                                Some(format!("failed to fetch certs.json: {}", e)),
-                            ),
-                        };
+                        let (cert_detailed, fetch_err_reason) =
+                            self.issuer_certification(id, &published.proof.creator_public_key);
 
                         match cert_detailed {
                             IssuerCertificationDetailed::Certified { organization_name } => {
@@ -1394,49 +1551,8 @@ impl DavpApp {
         if let Some(id) = published.issuer_certificate_id.as_deref() {
             status.push_str(&format!("issuer_certificate_id={}\n", id));
 
-            let (cert_detailed, fetch_err_reason) = match self.fetch_certs_bundle_for_verify() {
-                Ok(bundle) => {
-                    let ca_b64 = bundle
-                        .certificates
-                        .iter()
-                        .find(|c| c.certificate_id.trim() == id.trim())
-                        .and_then(|c| c.ca_public_key_base64.as_deref())
-                        .or(bundle.ca_public_key_base64.as_deref())
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string())
-                        .or_else(|| std::env::var("DAVP_CA_PUBLIC_KEY_BASE64").ok());
-
-                    match ca_b64 {
-                        Some(ca_b64) => {
-                            let ca_pk_bytes = base64::engine::general_purpose::STANDARD
-                                .decode(ca_b64.trim())
-                                .ok();
-                            let ca_pk: Option<[u8; 32]> = ca_pk_bytes.and_then(|b| b.try_into().ok());
-                            match ca_pk {
-                                Some(ca_pk) => {
-                                    let detailed = verify_issuer_certificate_detailed(
-                                        &bundle.certificates,
-                                        id,
-                                        &published.proof.creator_public_key,
-                                        &ca_pk,
-                                        chrono::Utc::now(),
-                                    )
-                                    .unwrap_or(IssuerCertificationDetailed::InvalidCaSignature);
-
-                                    (detailed, None)
-                                }
-                                None => (IssuerCertificationDetailed::InvalidCaSignature, None),
-                            }
-                        }
-                        None => (IssuerCertificationDetailed::InvalidCaSignature, None),
-                    }
-                }
-                Err(e) => (
-                    IssuerCertificationDetailed::NotFound,
-                    Some(format!("failed to fetch certs.json: {}", e)),
-                ),
-            };
+            let (cert_detailed, fetch_err_reason) =
+                self.issuer_certification(id, &published.proof.creator_public_key);
 
             match cert_detailed {
                 IssuerCertificationDetailed::Certified { organization_name } => {
