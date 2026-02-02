@@ -1,0 +1,271 @@
+1) High-level overview
+
+1.1 What DAVP is
+DAVP is a program and protocol implementation for creating, storing, verifying, and optionally replicating cryptographic proofs about arbitrary digital content (“assets”). A DAVP proof binds a content hash and metadata to a creator’s Ed25519 keypair via a digital signature, and assigns a 64-character verification ID used as a lookup identifier.
+
+The repository provides:
+- A CLI application (src/main.rs)
+- A GUI application (src/bin/davp_gui.rs)
+- A local filesystem storage layer (src/modules/storage.rs)
+- A simple peer-to-peer TCP networking layer for replication and lookup (src/modules/network.rs)
+- Optional issuer certificate verification using a remotely-fetched certs.json (src/modules/issuer_certificate.rs)
+
+1.2 What problem it solves
+DAVP solves the problem of verifiable, offline-checkable attribution of a specific content hash to a specific Ed25519 public key at a specific time, along with attached metadata. It allows:
+- Proving that a specific key signed a payload referencing a specific asset hash
+- Optionally checking that a given file matches the hash embedded in a proof
+- Storing proofs locally and looking them up by verification ID or by hash
+- Replicating proofs between peers without a central database
+
+1.3 What DAVP intentionally does NOT try to solve
+DAVP does not implement:
+- Global consensus, ordering, or finality
+- Blockchain, mining, or any consensus mechanism
+- Global immutability guarantees across the network
+- Truth claims about the metadata or real-world identity of a key
+- A global namespace or authority for verification IDs
+
+2) Core concepts
+
+2.1 Asset
+An asset is arbitrary content represented as raw bytes (typically a file). DAVP treats assets as opaque byte sequences; it does not parse or interpret file formats.
+
+2.2 Asset hash (blake3)
+DAVP computes a BLAKE3 hash of the asset bytes. This hash is embedded in the proof and is the cryptographic link between the proof and a particular asset.
+
+2.3 Proof
+A proof (src/modules/asset.rs) contains:
+- asset_hash: BLAKE3 hash of asset bytes
+- creator_public_key: Ed25519 public key bytes
+- timestamp: UTC timestamp
+- asset_type: an AssetType value (protocol-level classification)
+- ai_assisted: boolean flag
+- metadata: tags, optional description, optional parent_verification_id
+- signature: Ed25519 signature over a serialized signing payload
+- verification_id: 64-character string
+
+The signature is computed over a serialized payload that includes asset_hash, timestamp, asset_type, ai_assisted, and metadata. It does not include the signature itself, and it does not include verification_id.
+
+2.4 Verification ID
+The verification ID is a 64-character string generated from randomness and used as a lookup identifier.
+
+It is not a trust primitive:
+- It does not prove uniqueness globally
+- It does not provide security on its own
+- Authenticity comes from the signature and (optionally) hash check
+
+2.5 Creator keypair
+A creator keypair is an Ed25519 keypair used to sign proof payloads.
+- The public key is embedded in the proof.
+- The private key is required only for proof creation.
+
+2.6 Signature
+The proof signature is an Ed25519 signature computed over the serialized signing payload (bincode encoding). Verification recomputes the payload from the proof fields and checks the signature against the embedded creator_public_key.
+
+3) Proof lifecycle
+
+3.1 Creation (step-by-step)
+Creation is performed in src/modules/asset.rs and used by both the CLI and GUI.
+
+Steps:
+1) Read asset bytes (e.g., file contents).
+2) Compute asset_hash = blake3(asset_bytes).
+3) Set timestamp = current UTC time.
+4) Construct a signing payload consisting of:
+   - asset_hash
+   - timestamp
+   - asset_type
+   - ai_assisted
+   - metadata (tags/description/parent_verification_id)
+5) Serialize the signing payload using bincode.
+6) Sign the serialized payload with the creator Ed25519 keypair.
+7) Derive creator_public_key from the keypair.
+8) Generate verification_id:
+   - Generate 48 random bytes
+   - Base58-encode
+   - Take the first 64 characters
+9) Assemble the Proof struct.
+
+Notes on determinism:
+- Given the same inputs, the payload serialization and signature verification rules are deterministic.
+- The proof itself is not fully deterministic because timestamp and verification_id are generated at creation time.
+
+3.2 Storage (local filesystem)
+After creation, proofs are stored in a local directory selected by the user (storage_dir).
+
+Stored items:
+- Proof is stored as bincode bytes in <storage_dir>/<verification_id>.bin
+- Optional metadata is stored as bincode bytes in <storage_dir>/<verification_id>.meta.bin
+
+The files are created by writing full new files. DAVP does not implement in-place updates to existing proof files.
+
+3.3 Optional publication / replication
+DAVP supports optional “publication” by storing an associated issuer_certificate_id (if provided) alongside the proof.
+
+Replication is optional:
+- The CLI can replicate newly created proofs to specified peers.
+- Nodes can automatically replicate received proofs to their known peer set.
+
+4) Verification
+
+4.1 Hash verification (optional)
+Hash verification requires asset bytes.
+- If asset bytes are provided during verification, DAVP computes blake3(asset_bytes) and compares it with proof.asset_hash.
+- If bytes are not provided, this check is skipped.
+
+4.2 Signature verification (mandatory)
+Signature verification is always performed.
+- DAVP reconstructs the signing payload from the proof’s fields.
+- It serializes the payload using bincode.
+- It verifies the Ed25519 signature using proof.creator_public_key.
+
+4.3 What “valid” means cryptographically
+A proof is cryptographically valid if:
+- The signature verifies against the reconstructed signing payload and the embedded public key.
+- If asset bytes were provided, the bytes hash to the same asset_hash embedded in the proof.
+
+A valid proof proves that the holder of the corresponding private key signed the payload. It does not prove identity, intent, or truth of metadata.
+
+5) Issuer certificates
+
+5.1 Purpose (identity labeling, not authority)
+Issuer certificates provide optional labeling of a proof creator key with an organization_name, subject to a CA signature check.
+
+Issuer certificates do not change the cryptographic validity rules of a proof. They are an additional, externally-resolved identity layer.
+
+5.2 External resolution via certs.json
+DAVP resolves issuer certificates by fetching a JSON bundle (default URL in src/modules/issuer_certificate.rs):
+- DEFAULT_CERTS_URL = https://davpfoundation.github.io/site/certs.json
+
+The bundle can be either:
+- A JSON array of certificates, or
+- An object containing a "certificates" field, optionally with a default ca_public_key_base64.
+
+5.3 Certificate validation rules
+For a certificate_id to certify a proof creator key, DAVP checks:
+1) The certificate with matching certificate_id exists in the bundle.
+2) CA signature validity:
+   - Verify ca_signature against a serialized certificate payload.
+   - The code attempts a current payload format and a legacy payload format.
+3) Validity window:
+   - now must be within valid_from and valid_to (RFC3339, UTC).
+4) Key binding:
+   - The certificate issuer_public_key (decoded from base64) must equal the proof.creator_public_key.
+
+5.4 Valid proof vs certified proof vs uncertified proof
+- Valid proof:
+  - Signature verification passes and (if asset bytes provided) hash matches.
+- Certified proof:
+  - Proof is valid, and issuer certificate validation succeeds for the referenced issuer_certificate_id.
+- Uncertified proof:
+  - Proof is valid, but either no issuer_certificate_id is provided or the issuer certificate validation fails.
+
+6) Networking
+
+6.1 Node behavior
+DAVP nodes communicate over TCP and exchange bincode-serialized messages.
+A node:
+- Listens on a bind address
+- Accepts inbound connections
+- Handles exactly one message per connection in the current implementation
+- Stores received proofs locally and replicates them to known peers
+
+6.2 Message types
+Network message types (src/modules/network.rs) include:
+- PushProof(Proof)
+- PushPublishedProof(PublishedProof)
+- GetProof { verification_id }
+- ProofResponse { proof: Option<Proof> }
+- GetPublishedProof { verification_id }
+- PublishedProofResponse { published: Option<PublishedProof> }
+- GetIdsByHash { asset_hash }
+- IdsByHashResponse { verification_ids: Vec<String> }
+- Ping / Pong (peer discovery and graph exchange)
+
+6.3 Replication logic
+Replication rules (src/modules/network.rs):
+- When receiving PushProof:
+  - Verify signature (and structural checks) using verify_proof(proof, None)
+  - If not already stored locally, store and forward to known peers
+- When receiving PushPublishedProof:
+  - Verify signature using verify_proof(published.proof, None)
+  - Store published metadata
+  - Forward to known peers
+
+The network layer does not enforce global ordering, uniqueness, or consensus.
+
+6.4 CNT bootstrap role (discovery only, not authority)
+DAVP contains a tracker-report mechanism (bootstrap.rs / cnt.rs) used for peer discovery:
+- A node can report its address, known peers, and connected peers to a tracker server.
+- The tracker responds with a list of peer entries.
+
+This mechanism is discovery-only:
+- It does not sign or certify proofs.
+- It does not provide authority over validity.
+
+7) Storage model
+
+7.1 Local-first design
+DAVP storage is local filesystem-based. The local storage directory is the authoritative store for a node’s proofs.
+
+7.2 File layout
+In the configured storage directory:
+- <verification_id>.bin: bincode-serialized Proof
+- <verification_id>.meta.bin: bincode-serialized metadata containing issuer_certificate_id (optional)
+- hash_index.bin: bincode-serialized index mapping asset_hash -> list of verification_ids
+
+7.3 Hash index purpose
+The hash index enables lookup of all verification IDs that reference a particular asset hash.
+
+7.4 No global state
+There is no global database and no globally consistent state.
+- Each node stores what it has seen.
+- Replication is best-effort.
+- Different nodes can have different subsets of proofs.
+
+8) Security model
+
+8.1 What DAVP guarantees
+Given a stored proof, DAVP can guarantee:
+- Signature authenticity: the proof payload was signed by the private key corresponding to proof.creator_public_key.
+- Integrity of the signed fields: asset_hash, timestamp, asset_type, ai_assisted, and metadata are covered by the signature.
+- Optional asset binding: if asset bytes are provided and the hash check passes, the proof refers to that exact byte sequence.
+
+8.2 What DAVP explicitly does not guarantee
+DAVP does not guarantee:
+- Real-world identity of the key holder
+- Truth of metadata, timestamps, or claims
+- Uniqueness of verification IDs globally
+- Global availability or persistence of proofs
+- Resistance to Sybil attacks in peer discovery
+
+8.3 Threats it does not attempt to solve
+Examples of threats not addressed by design:
+- A malicious peer sending many valid but useless proofs
+- A malicious actor creating proofs for misleading metadata
+- Network-level censorship or partitioning
+- Global replay and duplication across independent nodes
+
+9) Failure modes
+
+9.1 Missing peers
+If no peers are available or reachable:
+- Replication does not occur.
+- Local create/verify still works using local storage.
+
+9.2 Missing certificates
+If certs.json cannot be fetched or does not contain the referenced issuer_certificate_id:
+- Proof verification can still be valid.
+- Certification status becomes unverified/not found.
+
+9.3 Network partition
+If the network partitions:
+- Different partitions may store/replicate different proof subsets.
+- There is no reconciliation mechanism beyond peers exchanging stored data when reachable.
+
+9.4 Offline verification
+Offline verification is supported as long as the verifying party has:
+- The proof (from local storage or received out-of-band)
+- Optionally the asset bytes to perform the hash check
+
+Issuer certificate checks require access to the certificate bundle unless the verifier provides it separately (the code can parse certificates from a string, but the GUI/CLI default path is network fetch).

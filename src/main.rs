@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, CommandFactory};
 use davp::modules::asset::create_proof_from_bytes;
-use davp::modules::bootstrap::{report_and_get_peers, PeerReport};
+use davp::modules::bootstrap::{report_and_get_peers, PeerEntry, PeerReport};
 use davp::modules::certification::PublishedProof;
 use davp::modules::issuer_certificate::{
     DEFAULT_CERTS_URL, IssuerCertificationStatus, fetch_certificate_bundle, fetch_certificates,
@@ -13,7 +13,7 @@ use davp::modules::network::{ping_peer, replicate_published_proof, replicate_pro
 use davp::modules::storage::Storage;
 use davp::modules::verification::verify_proof;
 use davp::KeypairBytes;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,8 +22,12 @@ use tokio::sync::RwLock;
 #[derive(Parser, Debug)]
 #[command(name = "davp")]
 struct Cli {
+    /// Launch the graphical user interface instead of the command-line interface
+    #[arg(long)]
+    gui: bool,
+
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -120,11 +124,29 @@ fn parse_asset_type(s: &str) -> Result<AssetType> {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    match cli.command {
+    if cli.gui {
+        return gui::run();
+    }
+
+    // Build a dedicated runtime for CLI operations
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    rt.block_on(cli_main(cli))
+}
+
+async fn cli_main(cli: Cli) -> Result<()> {
+    let Some(command) = cli.command else {
+        Cli::command().print_help()?;
+        return Ok(());
+    };
+
+    return match command {
         Commands::Keygen => {
             let keypair = KeypairBytes::generate();
             let pubkey = keypair.public_key_bytes()?;
@@ -467,152 +489,195 @@ async fn main() -> Result<()> {
             if let Some(server) = bootstrap_server {
                 let peers_for_task = Arc::clone(&peers_arc);
                 let peer_graph_for_task = Arc::clone(&peer_graph);
+
+                // Peer ping/gossip loop (fast path)
+                let peers_for_ping = Arc::clone(&peers_for_task);
+                let graph_for_ping = Arc::clone(&peer_graph_for_task);
                 tokio::spawn(async move {
                     let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
-                    let mut cnt_report_tick = tokio::time::interval(std::time::Duration::from_secs(2));
                     loop {
-                        tokio::select! {
-                            _ = tick.tick() => {
-                                // peer gossip fast path
-                                let snapshot = peers_for_task.read().await.clone();
-                                let connections_snapshot: Vec<PeerConnections> = {
-                                    let g = peer_graph_for_task.read().await;
-                                    g.iter()
-                                        .map(|(addr, connected_peers)| PeerConnections {
-                                            addr: *addr,
-                                            connected_peers: connected_peers.clone(),
-                                        })
-                                        .collect()
-                                };
+                        tick.tick().await;
 
-                                let mut join_set = tokio::task::JoinSet::new();
-                                for peer in snapshot.iter().copied() {
-                                    if peer == bind {
-                                        continue;
-                                    }
-                                    let known = snapshot.clone();
-                                    let conn = connections_snapshot.clone();
-                                    join_set.spawn(async move { (peer, ping_peer(peer, bind, known, conn).await) });
-                                }
+                        let snapshot = peers_for_ping.read().await.clone();
+                        let connections_snapshot: Vec<PeerConnections> = {
+                            let g = graph_for_ping.read().await;
+                            g.iter()
+                                .map(|(addr, connected_peers)| PeerConnections {
+                                    addr: *addr,
+                                    connected_peers: connected_peers.clone(),
+                                })
+                                .collect()
+                        };
 
-                                let mut connected = Vec::new();
-                                let mut dead = Vec::new();
-                                let mut any_connected = false;
-                                let mut newly_discovered = Vec::new();
-                                let mut conn_updates: Vec<PeerConnections> = Vec::new();
-
-                                while let Some(join_res) = join_set.join_next().await {
-                                    match join_res {
-                                        Ok((peer, Ok((peer_list, conn_graph)))) => {
-                                            connected.push(peer);
-                                            any_connected = true;
-
-                                            for p in peer_list {
-                                                if p == bind {
-                                                    continue;
-                                                }
-                                                if !newly_discovered.contains(&p) {
-                                                    newly_discovered.push(p);
-                                                }
-                                            }
-
-                                            if !conn_graph.is_empty() {
-                                                conn_updates.extend(conn_graph);
-                                            }
-                                        }
-                                        Ok((peer, Err(_))) => {
-                                            dead.push(peer);
-                                        }
-                                        Err(_) => {}
-                                    }
-                                }
-
-                                if !conn_updates.is_empty() {
-                                    let mut g = peer_graph_for_task.write().await;
-                                    for pc in conn_updates {
-                                        let entry = g.entry(pc.addr).or_default();
-                                        for p in pc.connected_peers {
-                                            if !entry.contains(&p) {
-                                                entry.push(p);
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if !dead.is_empty() {
-                                    let mut set = peers_for_task.write().await;
-                                    set.retain(|p| !dead.contains(p));
-                                    let mut g = peer_graph_for_task.write().await;
-                                    for d in dead.iter().copied() {
-                                        g.remove(&d);
-                                    }
-                                    for peers in g.values_mut() {
-                                        peers.retain(|p| !dead.contains(p));
-                                    }
-                                }
-
-                                if !newly_discovered.is_empty() {
-                                    let mut set = peers_for_task.write().await;
-                                    for p in newly_discovered {
-                                        if !set.contains(&p) {
-                                            set.push(p);
-                                        }
-                                    }
-                                }
-
-                                {
-                                    let mut g = peer_graph_for_task.write().await;
-                                    g.insert(bind, connected.clone());
-                                }
+                        let mut join_set = tokio::task::JoinSet::new();
+                        let peers_to_ping: Vec<SocketAddr> = snapshot
+                            .iter()
+                            .copied()
+                            .filter(|p| *p != bind)
+                            .take(max_peers)
+                            .collect();
+                        for peer in peers_to_ping.into_iter() {
+                            if peer == bind {
+                                continue;
                             }
-                            _ = cnt_report_tick.tick() => {
-                                // report to CNT every 5s
-                                let snapshot = peers_for_task.read().await.clone();
-                                let connections_snapshot: Vec<PeerConnections> = {
-                                    let g = peer_graph_for_task.read().await;
-                                    g.iter()
-                                        .map(|(addr, connected_peers)| PeerConnections {
-                                            addr: *addr,
-                                            connected_peers: connected_peers.clone(),
-                                        })
-                                        .collect()
-                                };
+                            let known = snapshot.clone();
+                            let conn = connections_snapshot.clone();
+                            join_set.spawn(async move { (peer, ping_peer(peer, bind, known, conn).await) });
+                        }
 
-                                let connected = {
-                                    let g = peer_graph_for_task.read().await;
-                                    g.get(&bind).cloned().unwrap_or_default()
-                                };
+                        let mut connected = Vec::new();
+                        let mut dead: HashSet<SocketAddr> = HashSet::new();
+                        let mut newly_discovered: HashSet<SocketAddr> = HashSet::new();
+                        let mut conn_updates: Vec<PeerConnections> = Vec::new();
 
-                                let report = PeerReport {
-                                    addr: bind,
-                                    known_peers: snapshot,
-                                    connected_peers: connected,
-                                };
+                        while let Some(join_res) = join_set.join_next().await {
+                            match join_res {
+                                Ok((peer, Ok((peer_list, conn_graph)))) => {
+                                    connected.push(peer);
 
-                                if let Ok(entries) = report_and_get_peers(server, report).await {
-                                    let mut set = peers_for_task.write().await;
-                                    let now = chrono::Utc::now();
-                                    for e in entries {
-                                        let expires_in = (e.expires_at - now).num_seconds();
-                                        println!(
-                                            "bootstrap_peer={} last_seen={} expires_in={}s connected={} known={}",
-                                            e.addr,
-                                            e.last_seen.to_rfc3339(),
-                                            expires_in,
-                                            e.connected_peers.len(),
-                                            e.known_peers.len()
-                                        );
-
-                                        if e.addr == bind {
+                                    for p in peer_list {
+                                        if p == bind {
                                             continue;
                                         }
-                                        if !set.contains(&e.addr) {
-                                            set.push(e.addr);
+                                        newly_discovered.insert(p);
+                                    }
+
+                                    for pc in conn_graph.iter() {
+                                        if pc.addr != bind {
+                                            newly_discovered.insert(pc.addr);
                                         }
+                                        for p in pc.connected_peers.iter().copied() {
+                                            if p == bind {
+                                                continue;
+                                            }
+                                            newly_discovered.insert(p);
+                                        }
+                                    }
+
+                                    if !conn_graph.is_empty() {
+                                        conn_updates.extend(conn_graph);
+                                    }
+                                }
+                                Ok((peer, Err(_))) => {
+                                    dead.insert(peer);
+                                }
+                                Err(_) => {}
+                            }
+                        }
+
+                        if !conn_updates.is_empty() {
+                            let mut g = graph_for_ping.write().await;
+                            for pc in conn_updates {
+                                let entry = g.entry(pc.addr).or_default();
+                                for p in pc.connected_peers {
+                                    if !entry.contains(&p) {
+                                        entry.push(p);
                                     }
                                 }
                             }
                         }
+
+                        if !dead.is_empty() {
+                            let mut set = peers_for_ping.write().await;
+                            set.retain(|p| !dead.contains(p));
+                            let mut g = graph_for_ping.write().await;
+                            for d in dead.iter().copied() {
+                                g.remove(&d);
+                            }
+                            for peers in g.values_mut() {
+                                peers.retain(|p| !dead.contains(p));
+                            }
+                        }
+
+                        if !newly_discovered.is_empty() {
+                            let mut set = peers_for_ping.write().await;
+                            for p in newly_discovered.into_iter() {
+                                if !set.contains(&p) {
+                                    set.push(p);
+                                }
+                            }
+                        }
+
+                        let mut g = graph_for_ping.write().await;
+                        g.insert(bind, connected);
+                    }
+                });
+
+                // CNT heartbeat loop: update last_seen every 1s; upload aggregated gossip every ~2s
+                let peers_for_cnt = Arc::clone(&peers_for_task);
+                let graph_for_cnt = Arc::clone(&peer_graph_for_task);
+                tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+                    let mut upload_gossip = false;
+                    let mut stable_hint = false;
+                    let mut cached_entries: Vec<PeerEntry> = Vec::new();
+
+                    loop {
+                        tick.tick().await;
+
+                        let send_gossip = upload_gossip && stable_hint;
+                        let report = if send_gossip {
+                            let snapshot = peers_for_cnt.read().await.clone();
+                            let connected = {
+                                let g = graph_for_cnt.read().await;
+                                g.get(&bind).cloned().unwrap_or_default()
+                            };
+
+                            let mut agg: std::collections::HashSet<SocketAddr> =
+                                std::collections::HashSet::new();
+                            for p in snapshot.iter().copied() {
+                                agg.insert(p);
+                            }
+                            for p in connected.iter().copied() {
+                                agg.insert(p);
+                            }
+                            for e in cached_entries.iter() {
+                                agg.insert(e.addr);
+                                for p in e.known_peers.iter().copied() {
+                                    agg.insert(p);
+                                }
+                                for p in e.connected_peers.iter().copied() {
+                                    agg.insert(p);
+                                }
+                            }
+
+                            agg.remove(&bind);
+                            let mut combined: Vec<SocketAddr> = agg.into_iter().collect();
+                            combined.sort();
+
+                            PeerReport {
+                                addr: bind,
+                                known_peers: combined,
+                                connected_peers: connected,
+                            }
+                        } else {
+                            PeerReport {
+                                addr: bind,
+                                known_peers: Vec::new(),
+                                connected_peers: Vec::new(),
+                            }
+                        };
+
+                        let Ok((entries, requester_stable)) = report_and_get_peers(server, report).await else {
+                            continue;
+                        };
+
+                        stable_hint = requester_stable;
+                        cached_entries = entries.clone();
+
+                        {
+                            let mut set = peers_for_cnt.write().await;
+                            for e in entries {
+                                if e.addr == bind {
+                                    continue;
+                                }
+                                if !set.contains(&e.addr) {
+                                    set.push(e.addr);
+                                }
+                            }
+                        }
+
+                        upload_gossip = !upload_gossip;
                     }
                 });
             }
@@ -625,5 +690,19 @@ async fn main() -> Result<()> {
 
             run_node(storage, config).await
         }
+    };
+}
+
+// --- GUI integration ------------------------------------------------------
+// Pull in the existing GUI application from `src/bin/davp_gui.rs` so that we
+// can launch it when the user passes `--gui`.
+#[allow(dead_code)]
+mod gui {
+    #![allow(non_snake_case)]
+    include!("bin/davp_gui.rs");
+
+    // Re-export the entrypoint so that the main binary can invoke it.
+    pub(crate) fn run() -> anyhow::Result<()> {
+        self::main()
     }
 }

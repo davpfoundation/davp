@@ -4,6 +4,7 @@ use crate::modules::hash::AssetHash;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug)]
@@ -31,7 +32,7 @@ impl Storage {
         fs::create_dir_all(&self.base_dir)?;
         let path = self.proof_path(&proof.verification_id);
         let bytes = bincode::serialize(proof)?;
-        fs::write(path, bytes)?;
+        self.write_once_bytes(&path, &bytes)?;
 
         let mut index = self.load_hash_index().unwrap_or_default();
         index
@@ -57,11 +58,16 @@ impl Storage {
     pub fn store_published_proof(&self, published: &PublishedProof) -> Result<()> {
         self.store_proof(&published.proof)?;
         fs::create_dir_all(&self.base_dir)?;
-        let meta = ProofMetadata {
-            issuer_certificate_id: published.issuer_certificate_id.clone(),
-        };
-        let bytes = bincode::serialize(&meta)?;
-        fs::write(self.proof_metadata_path(&published.proof.verification_id), bytes)?;
+        // Only persist metadata if an issuer_certificate_id is present.
+        // If it is None, absence of the metadata file represents the default state.
+        if published.issuer_certificate_id.is_some() {
+            let meta = ProofMetadata {
+                issuer_certificate_id: published.issuer_certificate_id.clone(),
+            };
+            let bytes = bincode::serialize(&meta)?;
+            let meta_path = self.proof_metadata_path(&published.proof.verification_id);
+            self.write_once_bytes(&meta_path, &bytes)?;
+        }
         Ok(())
     }
 
@@ -134,6 +140,44 @@ impl Storage {
         fs::create_dir_all(&self.base_dir)?;
         let bytes = bincode::serialize(index)?;
         fs::write(self.hash_index_path(), bytes)?;
+        Ok(())
+    }
+
+    fn write_once_bytes(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        if path.exists() {
+            let existing = fs::read(path)?;
+            if existing == bytes {
+                return Ok(());
+            }
+            return Err(anyhow!(
+                "refusing to overwrite existing file with different content: {}",
+                path.display()
+            ));
+        }
+
+        let mut f = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                // If creation failed due to a race, re-check and compare.
+                if path.exists() {
+                    let existing = fs::read(path)?;
+                    if existing == bytes {
+                        return Ok(());
+                    }
+                    return Err(anyhow!(
+                        "refusing to overwrite existing file with different content: {}",
+                        path.display()
+                    ));
+                }
+                return Err(e.into());
+            }
+        };
+
+        f.write_all(bytes)?;
         Ok(())
     }
 }

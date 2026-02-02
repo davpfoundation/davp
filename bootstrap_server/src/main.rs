@@ -9,6 +9,7 @@ use ratatui::widgets::{Block, Borders, Cell, Row, Table};
 use std::io::{stdout, Stdout};
 use std::net::SocketAddr;
 use std::time::Duration;
+use tokio::signal;
 use tokio::sync::watch;
 
 #[derive(Parser, Debug)]
@@ -17,7 +18,7 @@ struct Cli {
     #[arg(long, default_value = "0.0.0.0:9100")]
     bind: SocketAddr,
 
-    #[arg(long, default_value_t = 5)]
+    #[arg(long, default_value_t = 30)]
     ttl_seconds: i64,
 }
 
@@ -28,18 +29,31 @@ async fn main() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let server = start_server_with_shutdown(cli.bind, cli.ttl_seconds, shutdown_rx).await?;
 
-    enable_raw_mode()?;
-    stdout().execute(EnterAlternateScreen)?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+    let tui_setup = (|| -> Result<Terminal<CrosstermBackend<Stdout>>> {
+        enable_raw_mode()?;
+        stdout().execute(EnterAlternateScreen)?;
+        Ok(Terminal::new(CrosstermBackend::new(stdout()))?)
+    })();
 
-    let res = run_tui(&mut terminal, cli.bind, cli.ttl_seconds, server).await;
+    let res = match tui_setup {
+        Ok(mut terminal) => {
+            let res = run_tui(&mut terminal, cli.bind, cli.ttl_seconds, server).await;
+            let _ = disable_raw_mode();
+            let _ = stdout().execute(LeaveAlternateScreen);
+            let _ = terminal.show_cursor();
+            res
+        }
+        Err(e) => {
+            let _ = disable_raw_mode();
+            let _ = stdout().execute(LeaveAlternateScreen);
+            eprintln!("CNT TUI failed to start: {}", e);
+            eprintln!("CNT server is running in headless mode. Press Ctrl+C to stop.");
+            signal::ctrl_c().await?;
+            Ok(())
+        }
+    };
 
     let _ = shutdown_tx.send(true);
-
-    disable_raw_mode()?;
-    stdout().execute(LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
-
     res
 }
 
@@ -75,7 +89,10 @@ async fn run_tui(
 
             let header = Row::new(vec![
                 Cell::from("addr"),
+                Cell::from("uptime_s"),
+                Cell::from("first_seen"),
                 Cell::from("expires_in_ms"),
+                Cell::from("stable"),
                 Cell::from("connected"),
                 Cell::from("known"),
                 Cell::from("last_seen"),
@@ -86,7 +103,10 @@ async fn run_tui(
                 let expires_ms = (e.expires_at - now).num_milliseconds().max(0);
                 Row::new(vec![
                     Cell::from(e.addr.to_string()),
+                    Cell::from(e.uptime_seconds.to_string()),
+                    Cell::from(e.first_seen.to_rfc3339()),
                     Cell::from(expires_ms.to_string()),
+                    Cell::from(if e.stable { "yes" } else { "no" }),
                     Cell::from(e.connected_peers.len().to_string()),
                     Cell::from(e.known_peers.len().to_string()),
                     Cell::from(e.last_seen.to_rfc3339()),
@@ -97,7 +117,10 @@ async fn run_tui(
                 rows,
                 [
                     Constraint::Length(22),
+                    Constraint::Length(10),
+                    Constraint::Min(20),
                     Constraint::Length(14),
+                    Constraint::Length(7),
                     Constraint::Length(10),
                     Constraint::Length(10),
                     Constraint::Min(20),

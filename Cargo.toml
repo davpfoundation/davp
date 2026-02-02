@@ -3,6 +3,7 @@ name = "davp"
 version = "0.1.0"
 edition = "2021"
 default-run = "davp"
+autobins = false
 
 [dependencies]
 anyhow = "1"
@@ -21,6 +22,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 davp_bootstrap_server = { path = "bootstrap_server" }
+
+[[bin]]
+name = "davp"
+path = "src/main.rs"
 
 [workspace]
 members = ["bootstrap_server"]

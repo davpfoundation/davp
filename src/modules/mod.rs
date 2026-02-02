@@ -7,5 +7,6 @@ pub mod issuer_certificate;
 pub mod metadata;
 pub mod network;
 pub mod signature;
+pub mod settings;
 pub mod storage;
 pub mod verification;

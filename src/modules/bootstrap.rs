@@ -16,25 +16,37 @@ pub struct PeerReport {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerEntry {
     pub addr: SocketAddr,
+    pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
+    pub uptime_seconds: i64,
+    pub stable: bool,
     pub known_peers: Vec<SocketAddr>,
     pub connected_peers: Vec<SocketAddr>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-enum Message {
-    Report(PeerReport),
-    Peers(Vec<PeerEntry>),
+pub struct PeersResponse {
+    pub requester_stable: bool,
+    pub entries: Vec<PeerEntry>,
 }
 
-pub async fn report_and_get_peers(server: SocketAddr, report: PeerReport) -> Result<Vec<PeerEntry>> {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum Message {
+    Report(PeerReport),
+    Peers(PeersResponse),
+}
+
+pub async fn report_and_get_peers(
+    server: SocketAddr,
+    report: PeerReport,
+) -> Result<(Vec<PeerEntry>, bool)> {
     let mut stream = timeout(Duration::from_millis(200), TcpStream::connect(server)).await??;
     write_message(&mut stream, &Message::Report(report)).await?;
 
     match read_message(&mut stream).await? {
-        Message::Peers(list) => Ok(list),
-        _ => Ok(Vec::new()),
+        Message::Peers(res) => Ok((res.entries, res.requester_stable)),
+        _ => Ok((Vec::new(), false)),
     }
 }
 
