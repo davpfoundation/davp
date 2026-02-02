@@ -6,8 +6,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::RwLock;
 use tokio::sync::watch;
+use tokio::sync::RwLock;
 use tokio::time::{interval, timeout};
 
 const STABLE_AFTER: Duration = Duration::minutes(15);
@@ -190,7 +190,9 @@ async fn handle_client(
                     // Gate gossip uploads: only stable clients can update known/connected lists.
                     // Also treat empty lists as presence-only so a stable client can query its
                     // stable status without wiping previously stored gossip.
-                    if entry.stable && !(report.known_peers.is_empty() && report.connected_peers.is_empty()) {
+                    if entry.stable
+                        && !(report.known_peers.is_empty() && report.connected_peers.is_empty())
+                    {
                         entry.known_peers = report.known_peers;
                         entry.connected_peers = report.connected_peers;
                         should_infer_from_gossip = true;
@@ -356,14 +358,26 @@ async fn build_peer_entries(
             expires_at,
             uptime_seconds,
             stable: st.stable,
-            known_peers: if include_gossip { st.known_peers.clone() } else { Vec::new() },
-            connected_peers: if include_gossip { st.connected_peers.clone() } else { Vec::new() },
+            known_peers: if include_gossip {
+                st.known_peers.clone()
+            } else {
+                Vec::new()
+            },
+            connected_peers: if include_gossip {
+                st.connected_peers.clone()
+            } else {
+                Vec::new()
+            },
         });
     }
 
     // Keep ordering stable across heartbeats. Sorting by expires_at/last_seen causes
     // the list to constantly reshuffle due to timing races.
-    out.sort_by(|a, b| b.first_seen.cmp(&a.first_seen).then_with(|| a.addr.cmp(&b.addr)));
+    out.sort_by(|a, b| {
+        b.first_seen
+            .cmp(&a.first_seen)
+            .then_with(|| a.addr.cmp(&b.addr))
+    });
     out
 }
 
@@ -388,12 +402,19 @@ async fn prune_expired(peers: &Arc<RwLock<HashMap<SocketAddr, PeerState>>>, ttl:
     }
 }
 
-
 async fn write_message(stream: &mut TcpStream, msg: &Message) -> Result<()> {
     let bytes = bincode::serialize(msg)?;
     let len = bytes.len() as u32;
-    timeout(std::time::Duration::from_millis(200), stream.write_u32_le(len)).await??;
-    timeout(std::time::Duration::from_millis(200), stream.write_all(&bytes)).await??;
+    timeout(
+        std::time::Duration::from_millis(200),
+        stream.write_u32_le(len),
+    )
+    .await??;
+    timeout(
+        std::time::Duration::from_millis(200),
+        stream.write_all(&bytes),
+    )
+    .await??;
     timeout(std::time::Duration::from_millis(200), stream.flush()).await??;
     Ok(())
 }
@@ -401,6 +422,10 @@ async fn write_message(stream: &mut TcpStream, msg: &Message) -> Result<()> {
 async fn read_message(stream: &mut TcpStream) -> Result<Message> {
     let len = timeout(std::time::Duration::from_millis(200), stream.read_u32_le()).await?? as usize;
     let mut buf = vec![0u8; len];
-    timeout(std::time::Duration::from_millis(200), stream.read_exact(&mut buf)).await??;
+    timeout(
+        std::time::Duration::from_millis(200),
+        stream.read_exact(&mut buf),
+    )
+    .await??;
     Ok(bincode::deserialize::<Message>(&buf)?)
 }

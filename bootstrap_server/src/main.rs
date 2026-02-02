@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use crossterm::ExecutableCommand;
 use davp_bootstrap_server::start_server_with_shutdown;
 use ratatui::prelude::*;

@@ -1,5 +1,7 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use davp::modules::issuer_certificate::{verify_issuer_certificate, IssuerCertificate, IssuerCertificationStatus};
+use davp::modules::issuer_certificate::{
+    verify_issuer_certificate, IssuerCertificate, IssuerCertificationStatus,
+};
 use davp::modules::signature::{sign, KeypairBytes};
 
 #[test]
@@ -57,7 +59,12 @@ fn issuer_certificate_verification_happy_path() {
     )
     .unwrap();
 
-    assert_eq!(status, IssuerCertificationStatus::Certified { organization_name: "Test Org".to_string() });
+    assert_eq!(
+        status,
+        IssuerCertificationStatus::Certified {
+            organization_name: "Test Org".to_string()
+        }
+    );
 }
 
 #[test]

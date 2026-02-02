@@ -40,16 +40,8 @@ impl Storage {
             .entry(proof.asset_hash)
             .or_default()
             .push(proof.verification_id.clone());
-        index
-            .entries
-            .entry(proof.asset_hash)
-            .or_default()
-            .sort();
-        index
-            .entries
-            .entry(proof.asset_hash)
-            .or_default()
-            .dedup();
+        index.entries.entry(proof.asset_hash).or_default().sort();
+        index.entries.entry(proof.asset_hash).or_default().dedup();
         self.save_hash_index(&index)?;
 
         Ok(())
@@ -99,11 +91,7 @@ impl Storage {
 
     pub fn lookup_by_hash(&self, asset_hash: &AssetHash) -> Result<Vec<String>> {
         let index = self.load_hash_index().unwrap_or_default();
-        Ok(index
-            .entries
-            .get(asset_hash)
-            .cloned()
-            .unwrap_or_default())
+        Ok(index.entries.get(asset_hash).cloned().unwrap_or_default())
     }
 
     fn proof_path(&self, verification_id: &str) -> PathBuf {

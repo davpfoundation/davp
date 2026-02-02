@@ -10,8 +10,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::RwLock;
 use tokio::sync::watch;
+use tokio::sync::RwLock;
 use tokio::time::{timeout, Duration};
 
 #[derive(Clone, Debug)]
@@ -43,14 +43,33 @@ pub struct PeerConnections {
 enum Message {
     PushProof(Proof),
     PushPublishedProof(PublishedProof),
-    GetProof { verification_id: String },
-    ProofResponse { proof: Option<Proof> },
-    GetPublishedProof { verification_id: String },
-    PublishedProofResponse { published: Option<PublishedProof> },
-    GetIdsByHash { asset_hash: AssetHash },
-    IdsByHashResponse { verification_ids: Vec<String> },
-    Ping { from: SocketAddr, known_peers: Vec<SocketAddr>, connections: Vec<PeerConnections> },
-    Pong { known_peers: Vec<SocketAddr>, connections: Vec<PeerConnections> },
+    GetProof {
+        verification_id: String,
+    },
+    ProofResponse {
+        proof: Option<Proof>,
+    },
+    GetPublishedProof {
+        verification_id: String,
+    },
+    PublishedProofResponse {
+        published: Option<PublishedProof>,
+    },
+    GetIdsByHash {
+        asset_hash: AssetHash,
+    },
+    IdsByHashResponse {
+        verification_ids: Vec<String>,
+    },
+    Ping {
+        from: SocketAddr,
+        known_peers: Vec<SocketAddr>,
+        connections: Vec<PeerConnections>,
+    },
+    Pong {
+        known_peers: Vec<SocketAddr>,
+        connections: Vec<PeerConnections>,
+    },
 }
 
 pub async fn run_node(storage: Storage, config: NodeConfig) -> Result<()> {
@@ -71,7 +90,10 @@ pub async fn run_node(storage: Storage, config: NodeConfig) -> Result<()> {
     }
 }
 
-async fn request_published_proof(peer: SocketAddr, verification_id: &str) -> Result<Option<PublishedProof>> {
+async fn request_published_proof(
+    peer: SocketAddr,
+    verification_id: &str,
+) -> Result<Option<PublishedProof>> {
     let mut stream = timeout(Duration::from_millis(200), TcpStream::connect(peer)).await??;
     write_message(
         &mut stream,
@@ -176,23 +198,21 @@ async fn handle_connection(
             } else {
                 None
             };
-            write_message(
-                &mut stream,
-                &Message::PublishedProofResponse { published },
-            )
-            .await?;
+            write_message(&mut stream, &Message::PublishedProofResponse { published }).await?;
         }
         Message::GetIdsByHash { asset_hash } => {
             let verification_ids = storage.lookup_by_hash(&asset_hash).unwrap_or_default();
             write_message(
                 &mut stream,
-                &Message::IdsByHashResponse {
-                    verification_ids,
-                },
+                &Message::IdsByHashResponse { verification_ids },
             )
             .await?;
         }
-        Message::Ping { from, known_peers, connections } => {
+        Message::Ping {
+            from,
+            known_peers,
+            connections,
+        } => {
             merge_peers(&peers, from, &known_peers).await;
             merge_graph(&peer_graph, &connections).await;
             let peers_snapshot = peers.read().await.clone();
@@ -265,7 +285,10 @@ pub async fn ping_peer(
     .await?;
 
     match read_message(&mut stream).await? {
-        Message::Pong { known_peers, connections } => Ok((known_peers, connections)),
+        Message::Pong {
+            known_peers,
+            connections,
+        } => Ok((known_peers, connections)),
         _ => Ok((Vec::new(), Vec::new())),
     }
 }
@@ -324,7 +347,11 @@ async fn read_message(stream: &mut TcpStream) -> Result<Message> {
     Ok(bincode::deserialize::<Message>(&buf)?)
 }
 
-async fn merge_peers(peers: &Arc<RwLock<Vec<SocketAddr>>>, from: SocketAddr, additional: &[SocketAddr]) {
+async fn merge_peers(
+    peers: &Arc<RwLock<Vec<SocketAddr>>>,
+    from: SocketAddr,
+    additional: &[SocketAddr],
+) {
     let mut all = peers.write().await;
     if !all.contains(&from) {
         all.push(from);
@@ -336,7 +363,10 @@ async fn merge_peers(peers: &Arc<RwLock<Vec<SocketAddr>>>, from: SocketAddr, add
     }
 }
 
-async fn merge_graph(graph: &Arc<RwLock<HashMap<SocketAddr, Vec<SocketAddr>>>>, updates: &[PeerConnections]) {
+async fn merge_graph(
+    graph: &Arc<RwLock<HashMap<SocketAddr, Vec<SocketAddr>>>>,
+    updates: &[PeerConnections],
+) {
     let mut g = graph.write().await;
     for pc in updates {
         let entry = g.entry(pc.addr).or_default();
@@ -348,7 +378,9 @@ async fn merge_graph(graph: &Arc<RwLock<HashMap<SocketAddr, Vec<SocketAddr>>>>, 
     }
 }
 
-async fn snapshot_graph(graph: &Arc<RwLock<HashMap<SocketAddr, Vec<SocketAddr>>>>) -> Vec<PeerConnections> {
+async fn snapshot_graph(
+    graph: &Arc<RwLock<HashMap<SocketAddr, Vec<SocketAddr>>>>,
+) -> Vec<PeerConnections> {
     let g = graph.read().await;
     g.iter()
         .map(|(addr, connected_peers)| PeerConnections {

@@ -2,8 +2,8 @@ use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use ed25519_dalek::{Keypair, PublicKey, Signature, Signer, Verifier};
 use rand::rngs::OsRng;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde::de::Visitor;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub type PublicKeyBytes = [u8; 32];
 
@@ -136,7 +136,11 @@ pub fn sign(payload: &[u8], keypair: &KeypairBytes) -> Result<SignatureBytes> {
     Ok(SignatureBytes(kp.sign(payload).to_bytes()))
 }
 
-pub fn verify(payload: &[u8], signature: &SignatureBytes, public_key: &PublicKeyBytes) -> Result<()> {
+pub fn verify(
+    payload: &[u8],
+    signature: &SignatureBytes,
+    public_key: &PublicKeyBytes,
+) -> Result<()> {
     let pk = PublicKey::from_bytes(public_key).map_err(|e| anyhow!(e))?;
     let sig = Signature::from_bytes(&signature.0).map_err(|e| anyhow!(e))?;
     pk.verify(payload, &sig).map_err(|e| anyhow!(e))

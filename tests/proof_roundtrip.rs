@@ -11,8 +11,13 @@ fn proof_roundtrip_store_and_verify() {
     let content = b"hello davp";
     let keypair = KeypairBytes::generate();
 
-    let metadata = Metadata::new(Some(vec!["tag1".to_string()]), Some("desc".to_string()), None);
-    let proof = create_proof_from_bytes(content, AssetType::Text, false, metadata, &keypair).unwrap();
+    let metadata = Metadata::new(
+        Some(vec!["tag1".to_string()]),
+        Some("desc".to_string()),
+        None,
+    );
+    let proof =
+        create_proof_from_bytes(content, AssetType::Text, false, metadata, &keypair).unwrap();
 
     verify_proof(&proof, Some(content)).unwrap();
 

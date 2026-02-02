@@ -130,7 +130,9 @@ pub fn issuer_certificate_signing_payload_bytes(cert: &IssuerCertificate) -> Res
     Ok(bincode::serialize(&payload)?)
 }
 
-pub fn issuer_certificate_signing_payload_bytes_legacy(cert: &IssuerCertificate) -> Result<Vec<u8>> {
+pub fn issuer_certificate_signing_payload_bytes_legacy(
+    cert: &IssuerCertificate,
+) -> Result<Vec<u8>> {
     let payload = IssuerCertificatePayloadLegacy {
         certificate_id: cert.certificate_id.clone(),
         issuer_public_key: cert.issuer_public_key.clone(),
@@ -141,7 +143,10 @@ pub fn issuer_certificate_signing_payload_bytes_legacy(cert: &IssuerCertificate)
     Ok(bincode::serialize(&payload)?)
 }
 
-fn verify_certificate_ca_signature(cert: &IssuerCertificate, ca_public_key: &PublicKeyBytes) -> Result<()> {
+fn verify_certificate_ca_signature(
+    cert: &IssuerCertificate,
+    ca_public_key: &PublicKeyBytes,
+) -> Result<()> {
     let sig = decode_ed25519_signature_base64(&cert.ca_signature)?;
     let payload_bytes = issuer_certificate_signing_payload_bytes(cert)?;
     if verify(&payload_bytes, &sig, ca_public_key).is_ok() {

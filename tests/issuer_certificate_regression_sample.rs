@@ -1,5 +1,7 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use davp::modules::issuer_certificate::{verify_issuer_certificate, IssuerCertificationStatus, IssuerCertificate};
+use davp::modules::issuer_certificate::{
+    verify_issuer_certificate, IssuerCertificate, IssuerCertificationStatus,
+};
 
 #[test]
 fn issuer_certificate_regression_sample_from_certs_json() {

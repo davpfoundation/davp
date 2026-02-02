@@ -1,15 +1,17 @@
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use clap::{Parser, Subcommand, CommandFactory};
+use clap::{CommandFactory, Parser, Subcommand};
 use davp::modules::asset::create_proof_from_bytes;
 use davp::modules::bootstrap::{report_and_get_peers, PeerEntry, PeerReport};
 use davp::modules::certification::PublishedProof;
 use davp::modules::issuer_certificate::{
-    DEFAULT_CERTS_URL, IssuerCertificationStatus, fetch_certificate_bundle, fetch_certificates,
-    parse_certificates_json, verify_issuer_certificate,
+    fetch_certificate_bundle, fetch_certificates, parse_certificates_json,
+    verify_issuer_certificate, IssuerCertificationStatus, DEFAULT_CERTS_URL,
 };
 use davp::modules::metadata::{AssetType, Metadata};
-use davp::modules::network::{ping_peer, replicate_published_proof, replicate_proof, run_node, NodeConfig, PeerConnections};
+use davp::modules::network::{
+    ping_peer, replicate_proof, replicate_published_proof, run_node, NodeConfig, PeerConnections,
+};
 use davp::modules::storage::Storage;
 use davp::modules::verification::verify_proof;
 use davp::KeypairBytes;
@@ -253,7 +255,10 @@ async fn cli_main(cli: Cli) -> Result<()> {
                             Ok(b) => b,
                             Err(e) => {
                                 if debug_cert {
-                                    eprintln!("issuer_cert_debug: CA public key base64 decode failed: {}", e);
+                                    eprintln!(
+                                        "issuer_cert_debug: CA public key base64 decode failed: {}",
+                                        e
+                                    );
                                 }
                                 println!("unverified issuer");
                                 return Ok(());
@@ -277,7 +282,10 @@ async fn cli_main(cli: Cli) -> Result<()> {
                             Ok(b) => b,
                             Err(e) => {
                                 if debug_cert {
-                                    eprintln!("issuer_cert_debug: failed to fetch cert bundle: {:#}", e);
+                                    eprintln!(
+                                        "issuer_cert_debug: failed to fetch cert bundle: {:#}",
+                                        e
+                                    );
                                 }
                                 println!("unverified issuer");
                                 return Ok(());
@@ -287,22 +295,30 @@ async fn cli_main(cli: Cli) -> Result<()> {
                         if debug_cert {
                             eprintln!(
                                 "issuer_cert_debug: bundle.ca_public_key_base64 present={}",
-                                bundle.ca_public_key_base64.as_deref().map(str::trim).filter(|s| !s.is_empty()).is_some()
+                                bundle
+                                    .ca_public_key_base64
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .is_some()
                             );
                         }
 
-                        match bundle.ca_public_key_base64.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                            Some(b64) => {
-                                match STANDARD.decode(b64) {
-                                    Ok(bytes) => bytes.as_slice().try_into().ok(),
-                                    Err(e) => {
-                                        if debug_cert {
-                                            eprintln!("issuer_cert_debug: bundle CA public key base64 decode failed: {}", e);
-                                        }
-                                        None
+                        match bundle
+                            .ca_public_key_base64
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        {
+                            Some(b64) => match STANDARD.decode(b64) {
+                                Ok(bytes) => bytes.as_slice().try_into().ok(),
+                                Err(e) => {
+                                    if debug_cert {
+                                        eprintln!("issuer_cert_debug: bundle CA public key base64 decode failed: {}", e);
                                     }
+                                    None
                                 }
-                            }
+                            },
                             None => None,
                         }
                     };
@@ -315,7 +331,7 @@ async fn cli_main(cli: Cli) -> Result<()> {
                         return Ok(());
                     };
 
-                        let status = (|| async {
+                    let status = (|| async {
                             let certs = if let Some(b64) = &certs_json_base64 {
                                 if debug_cert {
                                     eprintln!("issuer_cert_debug: loading certificates from --certs_json_base64");
@@ -445,28 +461,31 @@ async fn cli_main(cli: Cli) -> Result<()> {
                         })()
                         .await;
 
-                        match status {
-                            Ok((_, IssuerCertificationStatus::Certified { organization_name })) => {
-                                println!("certified issuer");
-                                println!("organization_name={}", organization_name);
-                            }
-                            Ok((found, IssuerCertificationStatus::Unverified)) => {
-                                if debug_cert {
-                                    if found {
-                                        eprintln!("issuer_cert_debug: certificate found but issuer_public_key does not match proof.creator_public_key");
-                                    } else {
-                                        eprintln!("issuer_cert_debug: certificate_id not found in certs.json (possible CDN cache / wrong URL / cert not published)");
-                                    }
-                                }
-                                println!("unverified issuer");
-                            }
-                            Err(e) => {
-                                if debug_cert {
-                                    eprintln!("issuer_cert_debug: certificate verification failed: {:#}", e);
-                                }
-                                println!("unverified issuer");
-                            }
+                    match status {
+                        Ok((_, IssuerCertificationStatus::Certified { organization_name })) => {
+                            println!("certified issuer");
+                            println!("organization_name={}", organization_name);
                         }
+                        Ok((found, IssuerCertificationStatus::Unverified)) => {
+                            if debug_cert {
+                                if found {
+                                    eprintln!("issuer_cert_debug: certificate found but issuer_public_key does not match proof.creator_public_key");
+                                } else {
+                                    eprintln!("issuer_cert_debug: certificate_id not found in certs.json (possible CDN cache / wrong URL / cert not published)");
+                                }
+                            }
+                            println!("unverified issuer");
+                        }
+                        Err(e) => {
+                            if debug_cert {
+                                eprintln!(
+                                    "issuer_cert_debug: certificate verification failed: {:#}",
+                                    e
+                                );
+                            }
+                            println!("unverified issuer");
+                        }
+                    }
                 }
                 None => {
                     println!("unverified issuer");
@@ -482,7 +501,8 @@ async fn cli_main(cli: Cli) -> Result<()> {
             max_peers,
         } => {
             let storage = Storage::new(storage_dir);
-            let peers_arc: Arc<RwLock<Vec<SocketAddr>>> = Arc::new(RwLock::new(peers.unwrap_or_default()));
+            let peers_arc: Arc<RwLock<Vec<SocketAddr>>> =
+                Arc::new(RwLock::new(peers.unwrap_or_default()));
             let peer_graph: Arc<RwLock<HashMap<SocketAddr, Vec<SocketAddr>>>> =
                 Arc::new(RwLock::new(HashMap::new()));
 
@@ -522,7 +542,9 @@ async fn cli_main(cli: Cli) -> Result<()> {
                             }
                             let known = snapshot.clone();
                             let conn = connections_snapshot.clone();
-                            join_set.spawn(async move { (peer, ping_peer(peer, bind, known, conn).await) });
+                            join_set.spawn(async move {
+                                (peer, ping_peer(peer, bind, known, conn).await)
+                            });
                         }
 
                         let mut connected = Vec::new();
@@ -658,7 +680,9 @@ async fn cli_main(cli: Cli) -> Result<()> {
                             }
                         };
 
-                        let Ok((entries, requester_stable)) = report_and_get_peers(server, report).await else {
+                        let Ok((entries, requester_stable)) =
+                            report_and_get_peers(server, report).await
+                        else {
                             continue;
                         };
 

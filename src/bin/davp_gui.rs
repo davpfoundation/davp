@@ -63,10 +63,18 @@ struct CntUiStatus {
 fn issuer_unverified_reason(d: &IssuerCertificationDetailed) -> Option<String> {
     match d {
         IssuerCertificationDetailed::Certified { .. } => None,
-        IssuerCertificationDetailed::NotFound => Some("Certificate_id not found in certs.json".to_string()),
-        IssuerCertificationDetailed::InvalidCaSignature => Some("Certificate CA signature invalid".to_string()),
-        IssuerCertificationDetailed::InvalidValidityWindow => Some("Certificate not valid now (expired/not yet valid/invalid window)".to_string()),
-        IssuerCertificationDetailed::InvalidIssuerPublicKey => Some("Certificate issuer_public_key is invalid base64/length".to_string()),
+        IssuerCertificationDetailed::NotFound => {
+            Some("Certificate_id not found in certs.json".to_string())
+        }
+        IssuerCertificationDetailed::InvalidCaSignature => {
+            Some("Certificate CA signature invalid".to_string())
+        }
+        IssuerCertificationDetailed::InvalidValidityWindow => {
+            Some("Certificate not valid now (expired/not yet valid/invalid window)".to_string())
+        }
+        IssuerCertificationDetailed::InvalidIssuerPublicKey => {
+            Some("Certificate issuer_public_key is invalid base64/length".to_string())
+        }
         IssuerCertificationDetailed::IssuerKeyMismatch => Some(
             "Issuer key mismatch: proof.creator_public_key != certificate.issuer_public_key (you signed the proof with the wrong keypair)"
                 .to_string(),
@@ -76,7 +84,8 @@ fn issuer_unverified_reason(d: &IssuerCertificationDetailed) -> Option<String> {
 
 fn main() -> Result<()> {
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size(egui::vec2(700.0, 720.0)),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size(egui::vec2(700.0, 720.0)),
         ..Default::default()
     };
     eframe::run_native(
@@ -476,6 +485,11 @@ impl DavpApp {
     }
 
     fn ui_settings_section(&mut self, ui: &mut egui::Ui) {
+        if self.networking_started {
+            ui.add_space(6.0);
+            ui.colored_label(egui::Color32::YELLOW, "Stop networking to change settings.");
+            ui.add_space(6.0);
+        }
 
         ui.add_enabled_ui(!self.networking_started, |ui| {
             egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -588,18 +602,13 @@ impl DavpApp {
                     if ui.button("Refresh certs").clicked() {
                         let _ = self.fetch_certs_bundle_for_verify(true);
                     }
-                    
                 });
+
                 if !self.certs_last_fetch_status.is_empty() {
                     ui.monospace(&self.certs_last_fetch_status);
                 }
             });
         });
-        if self.networking_started {
-            ui.add_space(6.0);
-            ui.colored_label(egui::Color32::YELLOW, "Stop networking to change settings.");
-            ui.add_space(6.0);
-        }
     }
 
     fn ui_misc(&mut self, ui: &mut egui::Ui) {
