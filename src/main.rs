@@ -530,6 +530,11 @@ async fn cli_main(cli: Cli) -> Result<()> {
                                 .collect()
                         };
 
+                        let known_good_snapshot: Vec<SocketAddr> = {
+                            let g = graph_for_ping.read().await;
+                            g.get(&bind).cloned().unwrap_or_default()
+                        };
+
                         let mut join_set = tokio::task::JoinSet::new();
                         let peers_to_ping: Vec<SocketAddr> = snapshot
                             .iter()
@@ -541,7 +546,7 @@ async fn cli_main(cli: Cli) -> Result<()> {
                             if peer == bind {
                                 continue;
                             }
-                            let known = snapshot.clone();
+                            let known = known_good_snapshot.clone();
                             let conn = connections_snapshot.clone();
                             join_set.spawn(async move {
                                 (peer, ping_peer(peer, bind, known, conn).await)
@@ -631,42 +636,18 @@ async fn cli_main(cli: Cli) -> Result<()> {
                 let graph_for_cnt = Arc::clone(&peer_graph_for_task);
                 tokio::spawn(async move {
                     let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
-                    let mut cached_entries: Vec<PeerEntry> = Vec::new();
 
                     loop {
                         tick.tick().await;
 
-                        let snapshot = peers_for_cnt.read().await.clone();
                         let connected = {
                             let g = graph_for_cnt.read().await;
                             g.get(&bind).cloned().unwrap_or_default()
                         };
 
-                        let mut agg: std::collections::HashSet<SocketAddr> =
-                            std::collections::HashSet::new();
-                        for p in snapshot.iter().copied() {
-                            agg.insert(p);
-                        }
-                        for p in connected.iter().copied() {
-                            agg.insert(p);
-                        }
-                        for e in cached_entries.iter() {
-                            agg.insert(e.addr);
-                            for p in e.known_peers.iter().copied() {
-                                agg.insert(p);
-                            }
-                            for p in e.connected_peers.iter().copied() {
-                                agg.insert(p);
-                            }
-                        }
-
-                        agg.remove(&bind);
-                        let mut combined: Vec<SocketAddr> = agg.into_iter().collect();
-                        combined.sort();
-
                         let report = PeerReport {
                             addr: bind,
-                            known_peers: combined,
+                            known_peers: connected.clone(),
                             connected_peers: connected,
                         };
 
@@ -677,7 +658,6 @@ async fn cli_main(cli: Cli) -> Result<()> {
                         };
 
                         let _ = requester_stable;
-                        cached_entries = entries.clone();
 
                         {
                             let mut set = peers_for_cnt.write().await;
@@ -689,9 +669,6 @@ async fn cli_main(cli: Cli) -> Result<()> {
                                 let mut discovered: std::collections::HashSet<SocketAddr> =
                                     std::collections::HashSet::new();
                                 discovered.insert(e.addr);
-                                for p in e.known_peers.iter().copied() {
-                                    discovered.insert(p);
-                                }
                                 for p in e.connected_peers.iter().copied() {
                                     discovered.insert(p);
                                 }

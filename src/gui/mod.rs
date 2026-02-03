@@ -180,10 +180,10 @@ impl Default for DavpApp {
             peers: "".to_string(),
             seed_peers_last_applied: String::new(),
             seed_peers_last_error: String::new(),
-            cnt_server: "127.0.0.1:9100".to_string(),
+            cnt_server: "88.127.172.169:5157".to_string(),
             cnt_enabled: false,
 
-            cnt_selected_addr: "127.0.0.1:9100".to_string(),
+            cnt_selected_addr: "88.127.172.169:5157".to_string(),
             cnt_trackers: Vec::new(),
             cnt_new_name: String::new(),
             cnt_new_addr: String::new(),
@@ -335,7 +335,7 @@ impl DavpApp {
     const INPUT_WIDTH: f32 = 560.0;
 
     fn all_cnt_trackers(&self) -> Vec<(String, String)> {
-        let mut v = vec![("CNT World".to_string(), "127.0.0.1:9100".to_string())];
+        let mut v = vec![("CNT World".to_string(), "88.127.172.169:5157".to_string())];
         for t in &self.cnt_trackers {
             v.push((t.name.clone(), t.addr.clone()));
         }
@@ -441,7 +441,7 @@ impl DavpApp {
         {
             self.cnt_selected_addr = candidate.to_string();
         } else {
-            self.cnt_selected_addr = "127.0.0.1:9100".to_string();
+            self.cnt_selected_addr = "88.127.172.169:5157".to_string();
         }
         self.cnt_server = self.cnt_selected_addr.clone();
 
@@ -940,7 +940,7 @@ impl DavpApp {
                                 let new_addr = trackers
                                     .get(selected)
                                     .map(|(_, addr)| addr.clone())
-                                    .unwrap_or_else(|| "127.0.0.1:9100".to_string());
+                                    .unwrap_or_else(|| "88.127.172.169:5157".to_string());
                                 if new_addr.trim() != self.cnt_selected_addr.trim() {
                                     self.cnt_selected_addr = new_addr;
                                     self.cnt_server = self.cnt_selected_addr.clone();
@@ -2014,6 +2014,23 @@ async fn sync_network_once(ctx: SyncNetworkCtx) -> anyhow::Result<()> {
     let bind = ctx.bind;
     let snapshot = ctx.peers_arc.read().await.clone();
 
+    let known_good_snapshot: Vec<SocketAddr> = {
+        let now = Instant::now();
+        let mut out = Vec::new();
+        if let Ok(m) = ctx.recent_peer_hits.lock() {
+            for (addr, t) in m.iter() {
+                if *addr == bind {
+                    continue;
+                }
+                if now.duration_since(*t) <= Duration::from_secs(2) {
+                    out.push(*addr);
+                }
+            }
+        }
+        out.sort();
+        out
+    };
+
     let connections_snapshot: Vec<PeerConnections> = {
         let g = ctx.peer_graph.read().await;
         g.iter()
@@ -2061,7 +2078,7 @@ async fn sync_network_once(ctx: SyncNetworkCtx) -> anyhow::Result<()> {
             if peer == bind {
                 continue;
             }
-            let known = snapshot.clone();
+            let known = known_good_snapshot.clone();
             let conn = connections_snapshot.clone();
             join_set.spawn(async move { (peer, ping_peer(peer, bind, known, conn).await) });
         }
@@ -2209,47 +2226,19 @@ async fn cnt_report_once(ctx: CntReportCtx) -> anyhow::Result<()> {
         .unwrap_or(false);
     let send_gossip = ctx.upload_gossip && stable_hint;
 
-    let (known_peers, connected_peers, cached_entries) = if send_gossip {
-        let known_peers = ctx.peers_arc.read().await.clone();
-        let connected_peers = {
+    let connected_peers = if send_gossip {
+        {
             let g = ctx.peer_graph.read().await;
             g.get(&ctx.bind).cloned().unwrap_or_default()
-        };
-        let cached_entries: Vec<PeerEntry> = ctx
-            .bootstrap_entries
-            .lock()
-            .map(|g| g.clone())
-            .unwrap_or_default();
-        (known_peers, connected_peers, cached_entries)
+        }
     } else {
-        (Vec::new(), Vec::new(), Vec::new())
+        Vec::new()
     };
 
     let report = if send_gossip {
-        let mut agg: std::collections::HashSet<SocketAddr> = std::collections::HashSet::new();
-        for p in known_peers.iter().copied() {
-            agg.insert(p);
-        }
-        for p in connected_peers.iter().copied() {
-            agg.insert(p);
-        }
-        for e in cached_entries.iter() {
-            agg.insert(e.addr);
-            for p in e.known_peers.iter().copied() {
-                agg.insert(p);
-            }
-            for p in e.connected_peers.iter().copied() {
-                agg.insert(p);
-            }
-        }
-
-        agg.remove(&ctx.bind);
-        let mut combined: Vec<SocketAddr> = agg.into_iter().collect();
-        combined.sort();
-
         PeerReport {
             addr: ctx.bind,
-            known_peers: combined,
+            known_peers: connected_peers.clone(),
             connected_peers: connected_peers.clone(),
         }
     } else {
@@ -2281,9 +2270,6 @@ async fn cnt_report_once(ctx: CntReportCtx) -> anyhow::Result<()> {
                 let mut discovered: std::collections::HashSet<SocketAddr> =
                     std::collections::HashSet::new();
                 discovered.insert(e.addr);
-                for p in e.known_peers.iter().copied() {
-                    discovered.insert(p);
-                }
                 for p in e.connected_peers.iter().copied() {
                     discovered.insert(p);
                 }

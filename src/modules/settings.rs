@@ -69,11 +69,11 @@ fn default_max_peers() -> usize {
 }
 
 fn default_cnt_selected_addr() -> String {
-    "127.0.0.1:9100".to_string()
+    "88.127.172.169:5157".to_string()
 }
 
 fn default_certs_url() -> String {
-    "https://davpfoundation.github.io/site/certs.json".to_string()
+    "https://davpfoundation.github.io/certs.json".to_string()
 }
 
 fn default_create_asset_type() -> String {

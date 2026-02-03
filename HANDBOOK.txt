@@ -165,7 +165,7 @@ Issuer certificates do not change the cryptographic validity rules of a proof. T
 
 5.2 External resolution via certs.json
 DAVP resolves issuer certificates by fetching a JSON bundle (default URL in src/modules/issuer_certificate.rs):
-- DEFAULT_CERTS_URL = https://davpfoundation.github.io/site/certs.json
+- DEFAULT_CERTS_URL = https://davpfoundation.github.io/certs.json
 
 The bundle can be either:
 - A JSON array of certificates, or

@@ -68,3 +68,21 @@ Nodes can replicate proofs over a simple TCP protocol (bincode messages) and gos
 - Their currently connected peers
 
 The server stores these reports with a TTL and returns a list of peer entries to help nodes find each other. CNT is discovery-only: it does not sign, certify, or validate proofs, and it has no authority over validity.
+
+CNT is not a trusted authority. It is a hint system only.
+
+- **Discovery is not trust.** Proof authenticity is verified locally by each node.
+- **Fake peers are expected.** A Sybil attacker can flood CNT with random/unreachable addresses. This does not break proof security; it only wastes connection attempts.
+
+Node behavior:
+
+- Always try connecting to a peer before treating it as usable.
+- Drop peers that fail to respond.
+- Keep a small local set of peers that actually responded recently.
+- Gossip/report only peers that were recently reachable.
+
+CNT hygiene:
+
+- Reports are stored with a short TTL (minutes, configurable).
+- CNT rate-limits reports per source IP.
+- CNT caps total stored entries to prevent unbounded growth.
