@@ -11,7 +11,7 @@ permissions:
 
 env:
   TAG: ${{ github.ref_name }}
-  BINARIES: davp, bootstrap_server
+  BINARIES: davp davp_bootstrap_server
 
 jobs:
   build:
@@ -30,9 +30,8 @@ jobs:
 
       - name: Build (release)
         run: |
-          for bin in $BINARIES; do
-            cargo build --release --bin "$bin"
-          done
+          cargo build --release -p davp --bin davp
+          cargo build --release -p davp_bootstrap_server --bin davp_bootstrap_server
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -41,7 +40,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $pkg = "davp-$env:TAG-windows-x86_64"
           New-Item -ItemType Directory -Force -Path $pkg | Out-Null
-          foreach ($bin in @("davp","bootstrap_server")) {
+          foreach ($bin in @("davp","davp_bootstrap_server")) {
             Copy-Item -Force "target\release\$bin.exe" "$pkg\"
           }
           Compress-Archive -Force -Path "$pkg\*" -DestinationPath "$pkg.zip"
