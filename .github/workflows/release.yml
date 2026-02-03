@@ -11,7 +11,7 @@ permissions:
 
 env:
   TAG: ${{ github.ref_name }}
-  BINARIES: davp
+  BINARIES: davp, bootstrap_server
 
 jobs:
   build:
@@ -41,7 +41,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $pkg = "davp-$env:TAG-windows-x86_64"
           New-Item -ItemType Directory -Force -Path $pkg | Out-Null
-          foreach ($bin in @("davp")) {
+          foreach ($bin in @("davp","bootstrap_server")) {
             Copy-Item -Force "target\release\$bin.exe" "$pkg\"
           }
           Compress-Archive -Force -Path "$pkg\*" -DestinationPath "$pkg.zip"
