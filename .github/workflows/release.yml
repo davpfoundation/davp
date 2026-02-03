@@ -89,9 +89,18 @@ EOF
 </svg>
 EOF
 
+<<<<<<< HEAD
           echo '#!/bin/sh
 HERE="$(dirname "$(readlink -f "$0")")"
 exec "${HERE}/usr/bin/davp" "$@"' > "$APPDIR/AppRun"
+=======
+          cat > "$APPDIR/AppRun" <<'EOF'
+echo '#!/bin/sh
+HERE="$(dirname "$(readlink -f "$0")")"
+exec "${HERE}/usr/bin/davp" "$@"' > "$APPDIR/AppRun"
+chmod +x "$APPDIR/AppRun"
+
+>>>>>>> b910693f68d216a8bfef132dd4d6ce5138d3d973
           chmod +x "$APPDIR/AppRun"
 
           curl -L -o appimagetool "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage"
