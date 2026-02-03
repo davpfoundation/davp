@@ -130,7 +130,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     if cli.gui {
-        return gui::run();
+        return davp::gui::run_gui();
     }
 
     // Build a dedicated runtime for CLI operations
@@ -604,8 +604,8 @@ async fn cli_main(cli: Cli) -> Result<()> {
                             let mut set = peers_for_ping.write().await;
                             set.retain(|p| !dead.contains(p));
                             let mut g = graph_for_ping.write().await;
-                            for d in dead.iter().copied() {
-                                g.remove(&d);
+                            for d in dead.iter() {
+                                g.remove(d);
                             }
                             for peers in g.values_mut() {
                                 peers.retain(|p| !dead.contains(p));
@@ -721,16 +721,3 @@ async fn cli_main(cli: Cli) -> Result<()> {
     };
 }
 
-// --- GUI integration ------------------------------------------------------
-// Pull in the existing GUI application from `src/bin/davp_gui.rs` so that we
-// can launch it when the user passes `--gui`.
-#[allow(dead_code)]
-mod gui {
-    #![allow(non_snake_case)]
-    include!("bin/davp_gui.rs");
-
-    // Re-export the entrypoint so that the main binary can invoke it.
-    pub(crate) fn run() -> anyhow::Result<()> {
-        self::main()
-    }
-}

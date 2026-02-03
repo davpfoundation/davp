@@ -1,23 +1,23 @@
 use anyhow::Result;
 use base64::Engine as _;
-use davp::modules::asset::create_proof_from_bytes;
-use davp::modules::certification::PublishedProof;
-use davp::modules::hash::blake3_hash_bytes;
-use davp::modules::bootstrap::{report_and_get_peers, PeerEntry, PeerReport};
-use davp::modules::issuer_certificate::{
+use crate::modules::asset::create_proof_from_bytes;
+use crate::modules::bootstrap::{report_and_get_peers, PeerEntry, PeerReport};
+use crate::modules::certification::PublishedProof;
+use crate::modules::hash::blake3_hash_bytes;
+use crate::modules::issuer_certificate::{
     fetch_certificate_bundle, verify_issuer_certificate_detailed, IssuerCertificateBundle,
     IssuerCertificationDetailed, DEFAULT_CERTS_URL,
 };
-use davp::modules::metadata::{AssetType, Metadata};
-use davp::modules::network::{
+use crate::modules::metadata::{AssetType, Metadata};
+use crate::modules::network::{
     fetch_ids_by_hash_from_peers, fetch_proof_from_peers, fetch_published_proof_from_peers,
     replicate_published_proof, replicate_proof,
     run_node_with_shutdown, NodeConfig, PeerConnections, ping_peer,
 };
-use davp::modules::settings::{AppConfig, CntTrackerEntry};
-use davp::modules::storage::Storage;
-use davp::modules::verification::verify_proof;
-use davp::KeypairBytes;
+use crate::modules::settings::{AppConfig, CntTrackerEntry};
+use crate::modules::storage::Storage;
+use crate::modules::verification::verify_proof;
+use crate::KeypairBytes;
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -70,7 +70,7 @@ fn issuer_unverified_reason(d: &IssuerCertificationDetailed) -> Option<String> {
     }
 }
 
-fn main() -> Result<()> {
+pub fn run_gui() -> Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size(egui::vec2(700.0, 700.0)),
@@ -359,7 +359,7 @@ impl DavpApp {
             self.seed_peers_last_error.clear();
             if !self.networking_started {
                 let peers_arc = Arc::clone(&self.peers_arc);
-                let _ = self.rt.block_on(async move {
+                self.rt.block_on(async move {
                     peers_arc.write().await.clear();
                 });
             }
@@ -379,7 +379,7 @@ impl DavpApp {
 
         let peers_arc = Arc::clone(&self.peers_arc);
         let networking_started = self.networking_started;
-        let _ = self.rt.block_on(async move {
+        self.rt.block_on(async move {
             let mut peers = peers_arc.write().await;
             if !networking_started {
                 *peers = list;
@@ -394,35 +394,33 @@ impl DavpApp {
     }
 
     fn current_app_config_snapshot(&self) -> AppConfig {
-        let mut cfg = AppConfig::default();
+        AppConfig {
+            data_storage_location: self.storage_dir.trim().to_string(),
+            auto_save: true,
 
-        cfg.data_storage_location = self.storage_dir.trim().to_string();
-        cfg.auto_save = true;
+            peers: self.peers.clone(),
+            node_bind: self.node_bind.clone(),
+            max_peers: self.max_peers,
+            run_node_enabled: self.run_node_enabled,
 
-        cfg.peers = self.peers.clone();
-        cfg.node_bind = self.node_bind.clone();
-        cfg.max_peers = self.max_peers;
-        cfg.run_node_enabled = self.run_node_enabled;
+            cnt_enabled: self.cnt_enabled,
+            cnt_selected_addr: self.cnt_selected_addr.clone(),
+            cnt_trackers: self.cnt_trackers.clone(),
 
-        cfg.cnt_enabled = self.cnt_enabled;
-        cfg.cnt_selected_addr = self.cnt_selected_addr.clone();
-        cfg.cnt_trackers = self.cnt_trackers.clone();
+            certs_url: self.certs_url.clone(),
 
-        cfg.certs_url = self.certs_url.clone();
+            keypair_base64: self.keypair_base64.clone(),
+            create_file_path: self.create_file_path.clone(),
+            create_asset_type: self.create_asset_type.clone(),
+            create_ai_assisted: self.create_ai_assisted,
+            create_description: self.create_description.clone(),
+            create_tags: self.create_tags.clone(),
+            create_parent_verification_id: self.create_parent_verification_id.clone(),
+            create_issuer_certificate_id: self.create_issuer_certificate_id.clone(),
 
-        cfg.keypair_base64 = self.keypair_base64.clone();
-        cfg.create_file_path = self.create_file_path.clone();
-        cfg.create_asset_type = self.create_asset_type.clone();
-        cfg.create_ai_assisted = self.create_ai_assisted;
-        cfg.create_description = self.create_description.clone();
-        cfg.create_tags = self.create_tags.clone();
-        cfg.create_parent_verification_id = self.create_parent_verification_id.clone();
-        cfg.create_issuer_certificate_id = self.create_issuer_certificate_id.clone();
-
-        cfg.verify_verification_id = self.verify_verification_id.clone();
-        cfg.verify_file_path = self.verify_file_path.clone();
-
-        cfg
+            verify_verification_id: self.verify_verification_id.clone(),
+            verify_file_path: self.verify_file_path.clone(),
+        }
     }
 
     fn apply_app_config(&mut self, cfg: &AppConfig) {
@@ -783,7 +781,7 @@ impl DavpApp {
             if let Some(tx) = self.node_shutdown_tx.take() {
                 let _ = tx.send(true);
             }
-            let _ = self.rt.block_on(async { node_handle.await });
+            let _ = self.rt.block_on(node_handle);
         }
         self.networking_started = false;
         self.networking_started_at = None;
@@ -1113,9 +1111,8 @@ impl DavpApp {
         let cnt_ui_status_ping = Arc::clone(&cnt_ui_status);
 
         let (cnt_force_tx, mut cnt_force_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-        let cnt_force_tx_ping = cnt_force_tx.clone();
         let sync_handle = self.rt.spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+            let mut tick = tokio::time::interval(Duration::from_millis(100));
 
             loop {
                 if *sync_shutdown_rx_ping.borrow() {
@@ -1128,21 +1125,21 @@ impl DavpApp {
                     }
                     _ = tick.tick() => {
                         let cnt_enabled = *cnt_enabled_rx_ping.borrow();
-                        let _ = sync_network_once(
+                        let ctx = SyncNetworkCtx {
                             bind,
                             max_peers,
-                            Arc::clone(&peers_arc_ping),
-                            Arc::clone(&peer_graph_ping),
+                            peers_arc: Arc::clone(&peers_arc_ping),
+                            peer_graph: Arc::clone(&peer_graph_ping),
                             cnt_server,
-                            Arc::clone(&bootstrap_entries_ping),
-                            Arc::clone(&reachable_peers_ping),
-                            Arc::clone(&recent_peer_hits_ping),
-                            Arc::clone(&cnt_ui_status_ping),
+                            bootstrap_entries: Arc::clone(&bootstrap_entries_ping),
+                            reachable_peers: Arc::clone(&reachable_peers_ping),
+                            recent_peer_hits: Arc::clone(&recent_peer_hits_ping),
+                            cnt_ui_status: Arc::clone(&cnt_ui_status_ping),
                             cnt_enabled,
-                            false, // cnt_report_only
-                            cnt_force_tx_ping.clone(),
-                        )
-                        .await;
+                            cnt_report_only: false,
+                            cnt_force_tx: cnt_force_tx.clone(),
+                        };
+                        let _ = sync_network_once(ctx).await;
                     }
                 }
             }
@@ -1158,7 +1155,7 @@ impl DavpApp {
         let bootstrap_entries_cnt = Arc::clone(&bootstrap_entries);
         let cnt_ui_status_cnt = Arc::clone(&cnt_ui_status);
         let cnt_handle = self.rt.spawn(async move {
-            let mut cnt_report_tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            let mut tick = tokio::time::interval(Duration::from_secs(1));
             let mut upload_gossip = false;
             let mut last_forced_report: Option<Instant> = None;
 
@@ -1180,32 +1177,32 @@ impl DavpApp {
                         if can_send {
                             last_forced_report = Some(now);
                             let cnt_enabled = *cnt_enabled_rx_cnt.borrow();
-                            let _ = cnt_report_once(
+                            let ctx = CntReportCtx {
                                 bind,
-                                Arc::clone(&peers_arc_cnt),
-                                Arc::clone(&peer_graph_cnt),
+                                peers_arc: Arc::clone(&peers_arc_cnt),
+                                peer_graph: Arc::clone(&peer_graph_cnt),
                                 cnt_server,
-                                Arc::clone(&bootstrap_entries_cnt),
-                                Arc::clone(&cnt_ui_status_cnt),
+                                bootstrap_entries: Arc::clone(&bootstrap_entries_cnt),
+                                cnt_ui_status: Arc::clone(&cnt_ui_status_cnt),
                                 cnt_enabled,
-                                true,
-                            ).await;
+                                upload_gossip: true,
+                            };
+                            let _ = cnt_report_once(ctx).await;
                         }
                     }
-                    _ = cnt_report_tick.tick() => {
+                    _ = tick.tick() => {
                         let cnt_enabled = *cnt_enabled_rx_cnt.borrow();
-                        let _ = cnt_report_once(
+                        let ctx = CntReportCtx {
                             bind,
-                            Arc::clone(&peers_arc_cnt),
-                            Arc::clone(&peer_graph_cnt),
+                            peers_arc: Arc::clone(&peers_arc_cnt),
+                            peer_graph: Arc::clone(&peer_graph_cnt),
                             cnt_server,
-                            Arc::clone(&bootstrap_entries_cnt),
-                            Arc::clone(&cnt_ui_status_cnt),
+                            bootstrap_entries: Arc::clone(&bootstrap_entries_cnt),
+                            cnt_ui_status: Arc::clone(&cnt_ui_status_cnt),
                             cnt_enabled,
                             upload_gossip,
-                        ).await;
-
-                        // Upload aggregated gossip every ~2 seconds.
+                        };
+                        let _ = cnt_report_once(ctx).await;
                         upload_gossip = !upload_gossip;
                     }
                 }
@@ -1994,24 +1991,38 @@ impl DavpApp {
     }
 }
 
-async fn sync_network_once(
+struct SyncNetworkCtx {
     bind: SocketAddr,
     max_peers: usize,
     peers_arc: Arc<RwLock<Vec<SocketAddr>>>,
     peer_graph: Arc<RwLock<HashMap<SocketAddr, Vec<SocketAddr>>>>,
     cnt_server: SocketAddr,
     bootstrap_entries: Arc<Mutex<Vec<PeerEntry>>>,
-    _reachable_peers: Arc<Mutex<Vec<SocketAddr>>>,
+    reachable_peers: Arc<Mutex<Vec<SocketAddr>>>,
     recent_peer_hits: Arc<Mutex<HashMap<SocketAddr, Instant>>>,
     cnt_ui_status: Arc<Mutex<CntUiStatus>>,
     cnt_enabled: bool,
     cnt_report_only: bool,
     cnt_force_tx: tokio::sync::mpsc::UnboundedSender<()>,
-) -> anyhow::Result<()> {
-    let snapshot = peers_arc.read().await.clone();
+}
+
+struct CntReportCtx {
+    bind: SocketAddr,
+    peers_arc: Arc<RwLock<Vec<SocketAddr>>>,
+    peer_graph: Arc<RwLock<HashMap<SocketAddr, Vec<SocketAddr>>>>,
+    cnt_server: SocketAddr,
+    bootstrap_entries: Arc<Mutex<Vec<PeerEntry>>>,
+    cnt_ui_status: Arc<Mutex<CntUiStatus>>,
+    cnt_enabled: bool,
+    upload_gossip: bool,
+}
+
+async fn sync_network_once(ctx: SyncNetworkCtx) -> anyhow::Result<()> {
+    let bind = ctx.bind;
+    let snapshot = ctx.peers_arc.read().await.clone();
 
     let connections_snapshot: Vec<PeerConnections> = {
-        let g = peer_graph.read().await;
+        let g = ctx.peer_graph.read().await;
         g.iter()
             .map(|(addr, connected_peers)| PeerConnections {
                 addr: *addr,
@@ -2021,11 +2032,20 @@ async fn sync_network_once(
     };
 
     let mut join_set = tokio::task::JoinSet::new();
-    if !cnt_report_only {
-        let peers_to_ping: Vec<SocketAddr> = if snapshot.len() <= max_peers {
-            snapshot.iter().copied().filter(|p| *p != bind).collect()
+    if !ctx.cnt_report_only {
+        let peers_to_ping: Vec<SocketAddr> = if snapshot.len() <= ctx.max_peers {
+            snapshot
+                .iter()
+                .copied()
+                .filter(|p| *p != bind)
+                .collect()
         } else {
-            let last_hits = recent_peer_hits.lock().ok().map(|m| m.clone()).unwrap_or_default();
+            let last_hits = ctx
+                .recent_peer_hits
+                .lock()
+                .ok()
+                .map(|m| m.clone())
+                .unwrap_or_default();
             let now = Instant::now();
             let very_old = now
                 .checked_sub(Duration::from_secs(3600))
@@ -2037,7 +2057,11 @@ async fn sync_network_once(
                 .map(|p| (p, last_hits.get(&p).copied().unwrap_or(very_old)))
                 .collect();
             candidates.sort_by_key(|(_, t)| *t);
-            candidates.into_iter().take(max_peers).map(|(p, _)| p).collect()
+            candidates
+                .into_iter()
+                .take(ctx.max_peers)
+                .map(|(p, _)| p)
+                .collect()
         };
 
         for peer in peers_to_ping.into_iter() {
@@ -2055,12 +2079,12 @@ async fn sync_network_once(
     let mut newly_discovered: HashSet<SocketAddr> = HashSet::new();
     let mut conn_updates: Vec<PeerConnections> = Vec::new();
 
-    if !cnt_report_only {
+    if !ctx.cnt_report_only {
         while let Some(join_res) = join_set.join_next().await {
             match join_res {
                 Ok((peer, Ok((peer_list, conn_graph)))) => {
                     reachable.push(peer);
-                    if let Ok(mut m) = recent_peer_hits.lock() {
+                    if let Ok(mut m) = ctx.recent_peer_hits.lock() {
                         m.insert(peer, Instant::now());
                     }
                     for p in peer_list {
@@ -2094,7 +2118,7 @@ async fn sync_network_once(
         }
 
         if !conn_updates.is_empty() {
-            let mut g = peer_graph.write().await;
+            let mut g = ctx.peer_graph.write().await;
             for pc in conn_updates {
                 let entry = g.entry(pc.addr).or_default();
                 for p in pc.connected_peers {
@@ -2106,25 +2130,25 @@ async fn sync_network_once(
         }
 
         if !dead.is_empty() {
-            let mut set = peers_arc.write().await;
+            let mut set = ctx.peers_arc.write().await;
             set.retain(|p| !dead.contains(p));
-            let mut g = peer_graph.write().await;
-            for d in dead.iter().copied() {
-                g.remove(&d);
+            let mut g = ctx.peer_graph.write().await;
+            for d in dead.iter() {
+                g.remove(d);
             }
             for peers in g.values_mut() {
                 peers.retain(|p| !dead.contains(p));
             }
 
-            if let Ok(mut m) = recent_peer_hits.lock() {
-                for d in dead.iter().copied() {
-                    m.remove(&d);
+            if let Ok(mut m) = ctx.recent_peer_hits.lock() {
+                for d in dead.iter() {
+                    m.remove(d);
                 }
             }
         }
 
         if !newly_discovered.is_empty() {
-            let mut set = peers_arc.write().await;
+            let mut set = ctx.peers_arc.write().await;
             for p in newly_discovered.into_iter() {
                 if !set.contains(&p) {
                     set.push(p);
@@ -2133,10 +2157,10 @@ async fn sync_network_once(
         }
     }
 
-    if !cnt_report_only {
+    if !ctx.cnt_report_only {
         let now = Instant::now();
         let prev_connected: std::collections::HashSet<SocketAddr> = {
-            let g = peer_graph.read().await;
+            let g = ctx.peer_graph.read().await;
             g.get(&bind)
                 .cloned()
                 .unwrap_or_default()
@@ -2144,7 +2168,7 @@ async fn sync_network_once(
                 .collect()
         };
         let mut connected_recent: Vec<SocketAddr> = Vec::new();
-        if let Ok(m) = recent_peer_hits.lock() {
+        if let Ok(m) = ctx.recent_peer_hits.lock() {
             for (addr, t) in m.iter() {
                 if *addr == bind {
                     continue;
@@ -2160,49 +2184,49 @@ async fn sync_network_once(
             .iter()
             .any(|p| !prev_connected.contains(p));
 
-        let mut g = peer_graph.write().await;
+        let mut g = ctx.peer_graph.write().await;
         g.insert(bind, connected_recent);
 
         if has_new_connection {
-            let _ = cnt_force_tx.send(());
+            let _ = ctx.cnt_force_tx.send(());
         }
     }
 
     let _ = (
-        cnt_enabled,
-        cnt_server,
-        bootstrap_entries,
-        cnt_ui_status,
-        cnt_force_tx,
+        ctx.cnt_enabled,
+        ctx.cnt_server,
+        ctx.bootstrap_entries,
+        ctx.cnt_ui_status,
+        ctx.cnt_force_tx,
+        ctx.reachable_peers,
     );
 
     Ok(())
 }
 
-async fn cnt_report_once(
-    bind: SocketAddr,
-    peers_arc: Arc<RwLock<Vec<SocketAddr>>>,
-    peer_graph: Arc<RwLock<HashMap<SocketAddr, Vec<SocketAddr>>>>,
-    cnt_server: SocketAddr,
-    bootstrap_entries: Arc<Mutex<Vec<PeerEntry>>>,
-    cnt_ui_status: Arc<Mutex<CntUiStatus>>,
-    cnt_enabled: bool,
-    upload_gossip: bool,
-) -> anyhow::Result<()> {
-    if !cnt_enabled {
+async fn cnt_report_once(ctx: CntReportCtx) -> anyhow::Result<()> {
+    if !ctx.cnt_enabled {
         return Ok(());
     }
 
-    let stable_hint = cnt_ui_status.lock().map(|s| s.requester_stable).unwrap_or(false);
-    let send_gossip = upload_gossip && stable_hint;
+    let stable_hint = ctx
+        .cnt_ui_status
+        .lock()
+        .map(|s| s.requester_stable)
+        .unwrap_or(false);
+    let send_gossip = ctx.upload_gossip && stable_hint;
 
     let (known_peers, connected_peers, cached_entries) = if send_gossip {
-        let known_peers = peers_arc.read().await.clone();
+        let known_peers = ctx.peers_arc.read().await.clone();
         let connected_peers = {
-            let g = peer_graph.read().await;
-            g.get(&bind).cloned().unwrap_or_default()
+            let g = ctx.peer_graph.read().await;
+            g.get(&ctx.bind).cloned().unwrap_or_default()
         };
-        let cached_entries: Vec<PeerEntry> = bootstrap_entries.lock().map(|g| g.clone()).unwrap_or_default();
+        let cached_entries: Vec<PeerEntry> = ctx
+            .bootstrap_entries
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
         (known_peers, connected_peers, cached_entries)
     } else {
         (Vec::new(), Vec::new(), Vec::new())
@@ -2226,47 +2250,63 @@ async fn cnt_report_once(
             }
         }
 
-        agg.remove(&bind);
+        agg.remove(&ctx.bind);
         let mut combined: Vec<SocketAddr> = agg.into_iter().collect();
         combined.sort();
 
         PeerReport {
-            addr: bind,
+            addr: ctx.bind,
             known_peers: combined,
             connected_peers: connected_peers.clone(),
         }
     } else {
         PeerReport {
-            addr: bind,
+            addr: ctx.bind,
             known_peers: Vec::new(),
             connected_peers: Vec::new(),
         }
     };
 
-    match report_and_get_peers(cnt_server, report).await {
+    match report_and_get_peers(ctx.cnt_server, report).await {
         Ok((entries, requester_stable)) => {
-            if let Ok(mut s) = cnt_ui_status.lock() {
+            if let Ok(mut s) = ctx.cnt_ui_status.lock() {
                 s.last_ok = Some(Instant::now());
                 s.last_error = None;
                 s.last_entry_count = entries.len();
                 s.requester_stable = requester_stable;
             }
-            if let Ok(mut guard) = bootstrap_entries.lock() {
+            if let Ok(mut guard) = ctx.bootstrap_entries.lock() {
                 *guard = entries.clone();
             }
 
-            let mut set = peers_arc.write().await;
+            let mut set = ctx.peers_arc.write().await;
             for e in entries {
-                if e.addr == bind {
+                if e.addr == ctx.bind {
                     continue;
                 }
-                if !set.contains(&e.addr) {
-                    set.push(e.addr);
+
+                let mut discovered: std::collections::HashSet<SocketAddr> =
+                    std::collections::HashSet::new();
+                discovered.insert(e.addr);
+                for p in e.known_peers.iter().copied() {
+                    discovered.insert(p);
+                }
+                for p in e.connected_peers.iter().copied() {
+                    discovered.insert(p);
+                }
+
+                for p in discovered.into_iter() {
+                    if p == ctx.bind {
+                        continue;
+                    }
+                    if !set.contains(&p) {
+                        set.push(p);
+                    }
                 }
             }
         }
         Err(e) => {
-            if let Ok(mut s) = cnt_ui_status.lock() {
+            if let Ok(mut s) = ctx.cnt_ui_status.lock() {
                 s.last_error = Some(format!("{}", e));
                 s.last_entry_count = 0;
                 s.requester_stable = false;
