@@ -94,7 +94,9 @@ jobs:
 
           curl -L -o appimagetool "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage"
           chmod +x appimagetool
-          ./appimagetool "${APPDIR}" "davp-${tag}-linux-x86_64.AppImage"
+          rm -rf squashfs-root
+          ./appimagetool --appimage-extract
+          ./squashfs-root/AppRun "${APPDIR}" "davp-${tag}-linux-x86_64.AppImage"
 
       - name: Upload artifact (Linux tar.gz)
         if: runner.os == 'Linux'
