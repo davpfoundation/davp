@@ -187,12 +187,9 @@ async fn handle_client(
                     entry.reported = true;
                     entry.last_seen = now;
 
-                    // Gate gossip uploads: only stable clients can update known/connected lists.
-                    // Also treat empty lists as presence-only so a stable client can query its
-                    // stable status without wiping previously stored gossip.
-                    if entry.stable
-                        && !(report.known_peers.is_empty() && report.connected_peers.is_empty())
-                    {
+                    // Treat empty lists as presence-only so a client can query its stable status
+                    // without wiping previously stored gossip.
+                    if !(report.known_peers.is_empty() && report.connected_peers.is_empty()) {
                         entry.known_peers = report.known_peers;
                         entry.connected_peers = report.connected_peers;
                         should_infer_from_gossip = true;

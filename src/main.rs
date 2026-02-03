@@ -223,6 +223,7 @@ async fn cli_main(cli: Cli) -> Result<()> {
 
             verify_proof(&published.proof, content.as_deref())?;
             println!("valid");
+            println!("timestamp={}", published.proof.timestamp.to_rfc3339());
             println!("verification_id={}", published.proof.verification_id);
             println!(
                 "creator_public_key_base64={}",
@@ -630,54 +631,43 @@ async fn cli_main(cli: Cli) -> Result<()> {
                 let graph_for_cnt = Arc::clone(&peer_graph_for_task);
                 tokio::spawn(async move {
                     let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
-                    let mut upload_gossip = false;
-                    let mut stable_hint = false;
                     let mut cached_entries: Vec<PeerEntry> = Vec::new();
 
                     loop {
                         tick.tick().await;
 
-                        let send_gossip = upload_gossip && stable_hint;
-                        let report = if send_gossip {
-                            let snapshot = peers_for_cnt.read().await.clone();
-                            let connected = {
-                                let g = graph_for_cnt.read().await;
-                                g.get(&bind).cloned().unwrap_or_default()
-                            };
+                        let snapshot = peers_for_cnt.read().await.clone();
+                        let connected = {
+                            let g = graph_for_cnt.read().await;
+                            g.get(&bind).cloned().unwrap_or_default()
+                        };
 
-                            let mut agg: std::collections::HashSet<SocketAddr> =
-                                std::collections::HashSet::new();
-                            for p in snapshot.iter().copied() {
+                        let mut agg: std::collections::HashSet<SocketAddr> =
+                            std::collections::HashSet::new();
+                        for p in snapshot.iter().copied() {
+                            agg.insert(p);
+                        }
+                        for p in connected.iter().copied() {
+                            agg.insert(p);
+                        }
+                        for e in cached_entries.iter() {
+                            agg.insert(e.addr);
+                            for p in e.known_peers.iter().copied() {
                                 agg.insert(p);
                             }
-                            for p in connected.iter().copied() {
+                            for p in e.connected_peers.iter().copied() {
                                 agg.insert(p);
                             }
-                            for e in cached_entries.iter() {
-                                agg.insert(e.addr);
-                                for p in e.known_peers.iter().copied() {
-                                    agg.insert(p);
-                                }
-                                for p in e.connected_peers.iter().copied() {
-                                    agg.insert(p);
-                                }
-                            }
+                        }
 
-                            agg.remove(&bind);
-                            let mut combined: Vec<SocketAddr> = agg.into_iter().collect();
-                            combined.sort();
+                        agg.remove(&bind);
+                        let mut combined: Vec<SocketAddr> = agg.into_iter().collect();
+                        combined.sort();
 
-                            PeerReport {
-                                addr: bind,
-                                known_peers: combined,
-                                connected_peers: connected,
-                            }
-                        } else {
-                            PeerReport {
-                                addr: bind,
-                                known_peers: Vec::new(),
-                                connected_peers: Vec::new(),
-                            }
+                        let report = PeerReport {
+                            addr: bind,
+                            known_peers: combined,
+                            connected_peers: connected,
                         };
 
                         let Ok((entries, requester_stable)) =
@@ -686,7 +676,7 @@ async fn cli_main(cli: Cli) -> Result<()> {
                             continue;
                         };
 
-                        stable_hint = requester_stable;
+                        let _ = requester_stable;
                         cached_entries = entries.clone();
 
                         {
@@ -695,13 +685,27 @@ async fn cli_main(cli: Cli) -> Result<()> {
                                 if e.addr == bind {
                                     continue;
                                 }
-                                if !set.contains(&e.addr) {
-                                    set.push(e.addr);
+
+                                let mut discovered: std::collections::HashSet<SocketAddr> =
+                                    std::collections::HashSet::new();
+                                discovered.insert(e.addr);
+                                for p in e.known_peers.iter().copied() {
+                                    discovered.insert(p);
+                                }
+                                for p in e.connected_peers.iter().copied() {
+                                    discovered.insert(p);
+                                }
+
+                                for p in discovered.into_iter() {
+                                    if p == bind {
+                                        continue;
+                                    }
+                                    if !set.contains(&p) {
+                                        set.push(p);
+                                    }
                                 }
                             }
                         }
-
-                        upload_gossip = !upload_gossip;
                     }
                 });
             }

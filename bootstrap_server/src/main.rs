@@ -20,7 +20,7 @@ struct Cli {
     #[arg(long, default_value = "0.0.0.0:9100")]
     bind: SocketAddr,
 
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = 5)]
     ttl_seconds: i64,
 }
 

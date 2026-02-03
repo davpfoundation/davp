@@ -31,6 +31,7 @@ use tokio::sync::RwLock;
 #[derive(Debug, Clone)]
 struct VerifyResultView {
     verification_id: String,
+    timestamp_rfc3339: String,
     creator_public_key_base64: String,
     signature_base64: String,
     issuer_certificate_id: Option<String>,
@@ -72,7 +73,7 @@ fn issuer_unverified_reason(d: &IssuerCertificationDetailed) -> Option<String> {
 fn main() -> Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size(egui::vec2(700.0, 500.0)),
+            .with_inner_size(egui::vec2(700.0, 700.0)),
         ..Default::default()
     };
     eframe::run_native(
@@ -1244,7 +1245,17 @@ impl DavpApp {
             if !self.created_verification_id.is_empty() {
                 ui.add_space(8.0);
                 egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.heading("Output");
+                    ui.horizontal(|ui| {
+                        ui.heading("Output");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Dismiss").clicked() {
+                                self.created_verification_id.clear();
+                                self.created_creator_public_key_base64.clear();
+                                self.created_signature_base64.clear();
+                                self.created_issuer_certificate_id_display.clear();
+                            }
+                        });
+                    });
 
                     egui::Grid::new("create_output_grid")
                         .num_columns(2)
@@ -1266,7 +1277,7 @@ impl DavpApp {
                             });
                             ui.end_row();
 
-                            ui.label("creator_public_key");
+                            ui.label("Creator public key");
                             ui.horizontal(|ui| {
                                 let copy_w = 70.0;
                                 let spacing = ui.spacing().item_spacing.x;
@@ -1285,7 +1296,7 @@ impl DavpApp {
                             });
                             ui.end_row();
 
-                            ui.label("signature");
+                            ui.label("Signature");
                             ui.horizontal(|ui| {
                                 let copy_w = 70.0;
                                 let spacing = ui.spacing().item_spacing.x;
@@ -1329,85 +1340,121 @@ impl DavpApp {
             if self.verify_view.is_some() || !self.verify_status.is_empty() {
                 ui.add_space(8.0);
                 egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.heading("Verification result");
+                    ui.horizontal(|ui| {
+                        ui.heading("Verification result");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("Dismiss").clicked() {
+                                self.verify_view = None;
+                                self.verify_status.clear();
+                            }
+                        });
+                    });
 
                     if let Some(v) = &self.verify_view {
                         ui.horizontal(|ui| {
-                            ui.label("status");
+                            ui.label("Status");
                             ui.colored_label(egui::Color32::GREEN, "valid");
                         });
 
-                        let mut verification_id = v.verification_id.clone();
-                        let mut creator_public_key_base64 = v.creator_public_key_base64.clone();
-                        let mut signature_base64 = v.signature_base64.clone();
-
-                        egui::Grid::new("workspace_verify_result_grid")
+                        egui::Grid::new("verify_output_grid")
                             .num_columns(2)
-                            .spacing(egui::vec2(12.0, 8.0))
                             .show(ui, |ui| {
-                                ui.label("verification_id");
+                                ui.label("Timestamp");
                                 ui.horizontal(|ui| {
                                     let copy_w = 70.0;
                                     let spacing = ui.spacing().item_spacing.x;
                                     let w = (ui.available_width() - copy_w - spacing).max(120.0);
                                     ui.add_sized(
                                         [w, 44.0],
-                                        egui::TextEdit::multiline(&mut verification_id)
+                                        egui::TextEdit::multiline(&mut v.timestamp_rfc3339.clone())
                                             .desired_rows(2)
                                             .interactive(false),
                                     );
                                     if ui.add_sized([copy_w, 28.0], egui::Button::new("Copy")).clicked() {
-                                        ui.output_mut(|o| o.copied_text = verification_id.clone());
+                                        ui.output_mut(|o| o.copied_text = v.timestamp_rfc3339.clone());
                                     }
                                 });
                                 ui.end_row();
 
-                                ui.label("creator_public_key");
+                                ui.label("Verification ID");
                                 ui.horizontal(|ui| {
                                     let copy_w = 70.0;
                                     let spacing = ui.spacing().item_spacing.x;
                                     let w = (ui.available_width() - copy_w - spacing).max(120.0);
                                     ui.add_sized(
                                         [w, 44.0],
-                                        egui::TextEdit::multiline(&mut creator_public_key_base64)
+                                        egui::TextEdit::multiline(&mut v.verification_id.clone())
                                             .desired_rows(2)
                                             .interactive(false),
                                     );
                                     if ui.add_sized([copy_w, 28.0], egui::Button::new("Copy")).clicked() {
-                                        ui.output_mut(|o| o.copied_text = creator_public_key_base64.clone());
+                                        ui.output_mut(|o| o.copied_text = v.verification_id.clone());
                                     }
                                 });
                                 ui.end_row();
 
-                                ui.label("signature");
+                                ui.label("Creator public key");
                                 ui.horizontal(|ui| {
                                     let copy_w = 70.0;
                                     let spacing = ui.spacing().item_spacing.x;
                                     let w = (ui.available_width() - copy_w - spacing).max(120.0);
                                     ui.add_sized(
                                         [w, 44.0],
-                                        egui::TextEdit::multiline(&mut signature_base64)
+                                        egui::TextEdit::multiline(&mut v.creator_public_key_base64.clone())
                                             .desired_rows(2)
                                             .interactive(false),
                                     );
                                     if ui.add_sized([copy_w, 28.0], egui::Button::new("Copy")).clicked() {
-                                        ui.output_mut(|o| o.copied_text = signature_base64.clone());
+                                        ui.output_mut(|o| o.copied_text = v.creator_public_key_base64.clone());
                                     }
                                 });
                                 ui.end_row();
+
+                                ui.label("Signature");
+                                ui.horizontal(|ui| {
+                                    let copy_w = 70.0;
+                                    let spacing = ui.spacing().item_spacing.x;
+                                    let w = (ui.available_width() - copy_w - spacing).max(120.0);
+                                    ui.add_sized(
+                                        [w, 44.0],
+                                        egui::TextEdit::multiline(&mut v.signature_base64.clone())
+                                            .desired_rows(2)
+                                            .interactive(false),
+                                    );
+                                    if ui.add_sized([copy_w, 28.0], egui::Button::new("Copy")).clicked() {
+                                        ui.output_mut(|o| o.copied_text = v.signature_base64.clone());
+                                    }
+                                });
+                                ui.end_row();
+
+                                if let Some(id) = &v.issuer_certificate_id {
+                                    ui.label("issuer_certificate_id");
+                                    ui.horizontal(|ui| {
+                                        let copy_w = 70.0;
+                                        let spacing = ui.spacing().item_spacing.x;
+                                        let w = (ui.available_width() - copy_w - spacing).max(120.0);
+                                        ui.add_sized(
+                                            [w, 44.0],
+                                            egui::TextEdit::multiline(&mut id.clone())
+                                                .desired_rows(2)
+                                                .interactive(false),
+                                        );
+                                        if ui.add_sized([copy_w, 28.0], egui::Button::new("Copy")).clicked() {
+                                            ui.output_mut(|o| o.copied_text = id.clone());
+                                        }
+                                    });
+                                    ui.end_row();
+                                }
                             });
 
                         if let Some(id) = &v.issuer_certificate_id {
-                            ui.horizontal(|ui| {
-                                ui.label("issuer_certificate_id");
-                                ui.monospace(id);
-                                if ui.button("Copy").clicked() {
-                                    ui.output_mut(|o| o.copied_text = id.clone());
-                                }
-                            });
+                            let _ = id;
                             if v.issuer_certified {
                                 if let Some(org) = &v.organization_name {
-                                    ui.colored_label(egui::Color32::GREEN, format!("certified issuer: {}", org));
+                                    ui.colored_label(
+                                        egui::Color32::GREEN,
+                                        format!("certified issuer: {}", org),
+                                    );
                                 } else {
                                     ui.colored_label(egui::Color32::GREEN, "certified issuer");
                                 }
@@ -1762,6 +1809,7 @@ impl DavpApp {
                     let mut status = String::new();
                     status.push_str("valid\n");
                     status.push_str(&format!("verification_id={}\n", published.proof.verification_id));
+                    status.push_str(&format!("timestamp={}\n", published.proof.timestamp.to_rfc3339()));
                     status.push_str(&format!(
                         "creator_public_key_base64={}\n",
                         base64::engine::general_purpose::STANDARD.encode(published.proof.creator_public_key)
@@ -1782,6 +1830,7 @@ impl DavpApp {
                                 status.push_str(&format!("organization_name={}\n", organization_name));
                                 self.verify_view = Some(VerifyResultView {
                                     verification_id: published.proof.verification_id.clone(),
+                                    timestamp_rfc3339: published.proof.timestamp.to_rfc3339(),
                                     creator_public_key_base64: base64::engine::general_purpose::STANDARD
                                         .encode(published.proof.creator_public_key),
                                     signature_base64: base64::engine::general_purpose::STANDARD
@@ -1796,6 +1845,7 @@ impl DavpApp {
                                 status.push_str("unverified issuer\n");
                                 self.verify_view = Some(VerifyResultView {
                                     verification_id: published.proof.verification_id.clone(),
+                                    timestamp_rfc3339: published.proof.timestamp.to_rfc3339(),
                                     creator_public_key_base64: base64::engine::general_purpose::STANDARD
                                         .encode(published.proof.creator_public_key),
                                     signature_base64: base64::engine::general_purpose::STANDARD
@@ -1812,6 +1862,7 @@ impl DavpApp {
                         status.push_str("unverified issuer\n");
                         self.verify_view = Some(VerifyResultView {
                             verification_id: published.proof.verification_id.clone(),
+                            timestamp_rfc3339: published.proof.timestamp.to_rfc3339(),
                             creator_public_key_base64: base64::engine::general_purpose::STANDARD
                                 .encode(published.proof.creator_public_key),
                             signature_base64: base64::engine::general_purpose::STANDARD
@@ -1874,6 +1925,7 @@ impl DavpApp {
         let mut status = String::new();
         status.push_str("valid\n");
         status.push_str(&format!("verification_id={}\n", published.proof.verification_id));
+        status.push_str(&format!("timestamp={}\n", published.proof.timestamp.to_rfc3339()));
         status.push_str(&format!(
             "creator_public_key_base64={}\n",
             base64::engine::general_purpose::STANDARD.encode(published.proof.creator_public_key)
@@ -1894,6 +1946,7 @@ impl DavpApp {
                     status.push_str(&format!("organization_name={}\n", organization_name));
                     self.verify_view = Some(VerifyResultView {
                         verification_id: published.proof.verification_id.clone(),
+                        timestamp_rfc3339: published.proof.timestamp.to_rfc3339(),
                         creator_public_key_base64: base64::engine::general_purpose::STANDARD
                             .encode(published.proof.creator_public_key),
                         signature_base64: base64::engine::general_purpose::STANDARD
@@ -1908,6 +1961,7 @@ impl DavpApp {
                     status.push_str("unverified issuer\n");
                     self.verify_view = Some(VerifyResultView {
                         verification_id: published.proof.verification_id.clone(),
+                        timestamp_rfc3339: published.proof.timestamp.to_rfc3339(),
                         creator_public_key_base64: base64::engine::general_purpose::STANDARD
                             .encode(published.proof.creator_public_key),
                         signature_base64: base64::engine::general_purpose::STANDARD
@@ -1924,6 +1978,7 @@ impl DavpApp {
             status.push_str("unverified issuer\n");
             self.verify_view = Some(VerifyResultView {
                 verification_id: published.proof.verification_id.clone(),
+                timestamp_rfc3339: published.proof.timestamp.to_rfc3339(),
                 creator_public_key_base64: base64::engine::general_purpose::STANDARD
                     .encode(published.proof.creator_public_key),
                 signature_base64: base64::engine::general_purpose::STANDARD

@@ -1,0 +1,141 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: |
+          cargo build --release --bin davp
+          cargo build --release -p davp_bootstrap_server --bin davp_bootstrap_server
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = '${{ github.ref_name }}'
+          $pkg = "davp-$tag-windows-x86_64"
+          New-Item -ItemType Directory -Force -Path $pkg | Out-Null
+          Copy-Item -Force target\release\davp.exe $pkg\
+          Copy-Item -Force target\release\davp_bootstrap_server.exe $pkg\
+          Compress-Archive -Force -Path "$pkg\*" -DestinationPath "$pkg.zip"
+
+      - name: Upload artifact (Windows zip)
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-zip
+          path: davp-${{ github.ref_name }}-windows-x86_64.zip
+
+      - name: Package (Linux tar.gz + AppImage)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+
+          # tar.gz (davp + davp_bootstrap_server)
+          pkg="davp-${tag}-linux-x86_64"
+          mkdir -p "${pkg}"
+          cp -f target/release/davp "${pkg}/"
+          cp -f target/release/davp_bootstrap_server "${pkg}/"
+          tar -czf "${pkg}.tar.gz" "${pkg}"
+
+          # AppImage for davp
+          APPDIR="Davp.AppDir"
+          rm -rf "${APPDIR}"
+          mkdir -p "${APPDIR}/usr/bin"
+          cp -f target/release/davp "${APPDIR}/usr/bin/davp"
+
+          cat > "${APPDIR}/davp.desktop" <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=DAVP
+          Exec=davp
+          Icon=davp
+          Categories=Utility;
+          Terminal=true
+          EOF
+
+          cat > "${APPDIR}/davp.svg" <<'EOF'
+          <svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+            <rect width="256" height="256" rx="48" fill="#111827"/>
+            <text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle" font-size="72" font-family="Arial, sans-serif" fill="#ffffff">DAVP</text>
+          </svg>
+          EOF
+
+          cat > "${APPDIR}/AppRun" <<'EOF'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "${HERE}/usr/bin/davp" "$@"
+          EOF
+          chmod +x "${APPDIR}/AppRun"
+
+          curl -L -o appimagetool "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage"
+          chmod +x appimagetool
+          ./appimagetool "${APPDIR}" "davp-${tag}-linux-x86_64.AppImage"
+
+      - name: Upload artifact (Linux tar.gz)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-tar
+          path: davp-${{ github.ref_name }}-linux-x86_64.tar.gz
+
+      - name: Upload artifact (Linux AppImage)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-appimage
+          path: davp-${{ github.ref_name }}-linux-x86_64.AppImage
+
+  github_release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find dist -type f -maxdepth 2 -print -exec cp -f {} release/ \;
+          ls -la release
+
+      - name: Create checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release
+          sha256sum * > SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*
