@@ -20,7 +20,7 @@ use crate::modules::verification::verify_proof;
 use crate::KeypairBytes;
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -180,10 +180,10 @@ impl Default for DavpApp {
             peers: "".to_string(),
             seed_peers_last_applied: String::new(),
             seed_peers_last_error: String::new(),
-            cnt_server: "88.127.172.169:5157".to_string(),
+            cnt_server: "cnt.unitedorigins.com:5157".to_string(),
             cnt_enabled: false,
 
-            cnt_selected_addr: "88.127.172.169:5157".to_string(),
+            cnt_selected_addr: "cnt.unitedorigins.com:5157".to_string(),
             cnt_trackers: Vec::new(),
             cnt_new_name: String::new(),
             cnt_new_addr: String::new(),
@@ -335,7 +335,7 @@ impl DavpApp {
     const INPUT_WIDTH: f32 = 560.0;
 
     fn all_cnt_trackers(&self) -> Vec<(String, String)> {
-        let mut v = vec![("CNT World".to_string(), "88.127.172.169:5157".to_string())];
+        let mut v = vec![("CNT World".to_string(), "cnt.unitedorigins.com:5157".to_string())];
         for t in &self.cnt_trackers {
             v.push((t.name.clone(), t.addr.clone()));
         }
@@ -441,7 +441,7 @@ impl DavpApp {
         {
             self.cnt_selected_addr = candidate.to_string();
         } else {
-            self.cnt_selected_addr = "88.127.172.169:5157".to_string();
+            self.cnt_selected_addr = "cnt.unitedorigins.com:5157".to_string();
         }
         self.cnt_server = self.cnt_selected_addr.clone();
 
@@ -940,7 +940,7 @@ impl DavpApp {
                                 let new_addr = trackers
                                     .get(selected)
                                     .map(|(_, addr)| addr.clone())
-                                    .unwrap_or_else(|| "88.127.172.169:5157".to_string());
+                                    .unwrap_or_else(|| "cnt.unitedorigins.com:5157".to_string());
                                 if new_addr.trim() != self.cnt_selected_addr.trim() {
                                     self.cnt_selected_addr = new_addr;
                                     self.cnt_server = self.cnt_selected_addr.clone();
@@ -1065,9 +1065,9 @@ impl DavpApp {
         let recent_peer_hits = Arc::clone(&self.recent_peer_hits);
         let cnt_ui_status = Arc::clone(&self.cnt_ui_status);
 
-        let cnt_server: SocketAddr = match self.cnt_server.parse() {
-            Ok(v) => v,
-            Err(_) => return,
+        let cnt_server: SocketAddr = match resolve_socket_addr(self.cnt_server.trim()) {
+            Some(v) => v,
+            None => return,
         };
         let max_peers = self.max_peers;
 
@@ -2303,12 +2303,18 @@ fn parse_tags(tags: &str) -> Option<Vec<String>> {
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
         .collect();
-
     if parts.is_empty() {
         None
     } else {
         Some(parts)
     }
+}
+
+fn resolve_socket_addr(s: &str) -> Option<SocketAddr> {
+    if let Ok(v) = s.parse::<SocketAddr>() {
+        return Some(v);
+    }
+    s.to_socket_addrs().ok()?.next()
 }
 
 fn parse_asset_type(s: &str) -> std::result::Result<AssetType, String> {

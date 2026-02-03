@@ -69,7 +69,7 @@ fn default_max_peers() -> usize {
 }
 
 fn default_cnt_selected_addr() -> String {
-    "88.127.172.169:5157".to_string()
+    "cnt.unitedorigins.com:5157".to_string()
 }
 
 fn default_certs_url() -> String {
