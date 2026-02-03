@@ -9,10 +9,6 @@ on:
 permissions:
   contents: write
 
-env:
-  TAG: ${{ github.ref_name }}
-  BINARIES: davp davp_bootstrap_server
-
 jobs:
   build:
     strategy:
@@ -30,7 +26,7 @@ jobs:
 
       - name: Build (release)
         run: |
-          cargo build --release -p davp --bin davp
+          cargo build --release --bin davp
           cargo build --release -p davp_bootstrap_server --bin davp_bootstrap_server
 
       - name: Package (Windows)
@@ -38,40 +34,41 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $pkg = "davp-$env:TAG-windows-x86_64"
+          $tag = '${{ github.ref_name }}'
+          $pkg = "davp-$tag-windows-x86_64"
           New-Item -ItemType Directory -Force -Path $pkg | Out-Null
-          foreach ($bin in @("davp","davp_bootstrap_server")) {
-            Copy-Item -Force "target\release\$bin.exe" "$pkg\"
-          }
+          Copy-Item -Force target\release\davp.exe $pkg\
+          Copy-Item -Force target\release\davp_bootstrap_server.exe $pkg\
           Compress-Archive -Force -Path "$pkg\*" -DestinationPath "$pkg.zip"
 
-      - name: Upload artifact (Windows)
+      - name: Upload artifact (Windows zip)
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
-          name: windows-artifacts
-          path: davp-${{ env.TAG }}-windows-x86_64.zip
+          name: windows-zip
+          path: davp-${{ github.ref_name }}-windows-x86_64.zip
 
-      - name: Package (Linux)
+      - name: Package (Linux tar.gz + AppImage)
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
-          
-          pkg="davp-${TAG}-linux-x86_64"
-          mkdir -p "$pkg"
-          for bin in $BINARIES; do
-            cp -f "target/release/$bin" "$pkg/"
-          done
-          tar -czf "$pkg.tar.gz" "$pkg"
+          tag="${GITHUB_REF_NAME}"
 
-          # AppImage
+          # tar.gz (davp + davp_bootstrap_server)
+          pkg="davp-${tag}-linux-x86_64"
+          mkdir -p "${pkg}"
+          cp -f target/release/davp "${pkg}/"
+          cp -f target/release/davp_bootstrap_server "${pkg}/"
+          tar -czf "${pkg}.tar.gz" "${pkg}"
+
+          # AppImage for davp
           APPDIR="Davp.AppDir"
-          rm -rf "$APPDIR"
-          mkdir -p "$APPDIR/usr/bin"
-          cp -f target/release/davp "$APPDIR/usr/bin/"
+          rm -rf "${APPDIR}"
+          mkdir -p "${APPDIR}/usr/bin"
+          cp -f target/release/davp "${APPDIR}/usr/bin/davp"
 
-          cat <<'EOF' | sed 's/^          //' > "$APPDIR/davp.desktop"
+          cat > "${APPDIR}/davp.desktop" <<'EOF'
           [Desktop Entry]
           Type=Application
           Name=DAVP
@@ -81,29 +78,66 @@ jobs:
           Terminal=true
           EOF
 
-          cat <<'EOF' | sed 's/^          //' > "$APPDIR/davp.svg"
+          cat > "${APPDIR}/davp.svg" <<'EOF'
           <svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
             <rect width="256" height="256" rx="48" fill="#111827"/>
             <text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle" font-size="72" font-family="Arial, sans-serif" fill="#ffffff">DAVP</text>
           </svg>
           EOF
 
-          cat <<'EOF' | sed 's/^          //' > "$APPDIR/AppRun"
+          cat > "${APPDIR}/AppRun" <<'EOF'
           #!/bin/sh
           HERE="$(dirname "$(readlink -f "$0")")"
           exec "${HERE}/usr/bin/davp" "$@"
           EOF
-          chmod +x "$APPDIR/AppRun"
+          chmod +x "${APPDIR}/AppRun"
 
           curl -L -o appimagetool "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage"
           chmod +x appimagetool
-          ./appimagetool "$APPDIR" "davp-${TAG}-linux-x86_64.AppImage"
+          rm -rf squashfs-root
+          ./appimagetool --appimage-extract
+          ./squashfs-root/AppRun "${APPDIR}" "davp-${tag}-linux-x86_64.AppImage"
 
-      - name: Upload artifacts (Linux)
+      - name: Upload artifact (Linux tar.gz)
         if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
-          name: linux-artifacts
-          path: |
-            davp-${{ env.TAG }}-linux-x86_64.tar.gz
-            davp-${{ env.TAG }}-linux-x86_64.AppImage
+          name: linux-tar
+          path: davp-${{ github.ref_name }}-linux-x86_64.tar.gz
+
+      - name: Upload artifact (Linux AppImage)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-appimage
+          path: davp-${{ github.ref_name }}-linux-x86_64.AppImage
+
+  github_release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Flatten artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find dist -type f -maxdepth 2 -print -exec cp -f {} release/ \;
+          ls -la release
+
+      - name: Create checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release
+          sha256sum * > SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*
