@@ -43,7 +43,7 @@ A proof is cryptographically valid if:
 - No global immutability guarantees across the network
 - No truth claims about metadata or real-world identity of a key
 - No global namespace or authority for verification IDs
-- 
+
 DAVP avoids global consensus, blockchains, and trusted authorities. It is a simple, local-first protocol for cryptographic proofs.
 
 ## Issuer certificates
@@ -56,7 +56,7 @@ Issuer certificates are an optional identity label layer. They do not change wha
 - Certified proof: valid proof + issuer certificate validation succeeds for the referenced issuer_certificate_id.
 - Uncertified proof: valid proof + no issuer_certificate_id, or certificate validation fails/not found.
 
-Certificates are fetched from https://davpfoundation.github.io/site/certs.json by default. *We will soon migrate to a dedicated repository server*
+Certificates are fetched from https://davpfoundation.github.io/certs.json by default. *We will soon migrate to a dedicated repository server*
 
 
 ## Networking and CNT

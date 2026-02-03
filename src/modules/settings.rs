@@ -19,60 +19,53 @@ pub struct AppConfig {
     pub auto_save: bool,
 
     // GUI / runtime options (persisted so the app can restore state on startup)
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub peers: String,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub node_bind: String,
 
-    #[serde(default = "default_max_peers")]
+    #[serde(default = "default_max_peers", skip_serializing)]
     pub max_peers: usize,
 
-    #[serde(default = "default_run_node_enabled")]
-    pub run_node_enabled: bool,
-
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub cnt_enabled: bool,
 
-    #[serde(default = "default_cnt_selected_addr")]
+    #[serde(default = "default_cnt_selected_addr", skip_serializing)]
     pub cnt_selected_addr: String,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub cnt_trackers: Vec<CntTrackerEntry>,
 
-    #[serde(default = "default_certs_url")]
+    #[serde(default = "default_certs_url", skip_serializing)]
     pub certs_url: String,
 
     // Create / verify form state
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub keypair_base64: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub create_file_path: String,
-    #[serde(default = "default_create_asset_type")]
+    #[serde(default = "default_create_asset_type", skip_serializing)]
     pub create_asset_type: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub create_ai_assisted: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub create_description: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub create_tags: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub create_parent_verification_id: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub create_issuer_certificate_id: String,
 
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub verify_verification_id: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub verify_file_path: String,
 }
 
 fn default_max_peers() -> usize {
-    10
-}
-
-fn default_run_node_enabled() -> bool {
-    true
+    50
 }
 
 fn default_cnt_selected_addr() -> String {
@@ -96,7 +89,6 @@ impl Default for AppConfig {
             peers: String::new(),
             node_bind: "127.0.0.1:9002".to_string(),
             max_peers: default_max_peers(),
-            run_node_enabled: default_run_node_enabled(),
             cnt_enabled: false,
             cnt_selected_addr: default_cnt_selected_addr(),
             cnt_trackers: Vec::new(),

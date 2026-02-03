@@ -108,7 +108,6 @@ struct DavpApp {
 
     node_bind: String,
     max_peers: usize,
-    run_node_enabled: bool,
 
     networking_started: bool,
     networking_started_at: Option<Instant>,
@@ -189,8 +188,7 @@ impl Default for DavpApp {
             cnt_new_name: String::new(),
             cnt_new_addr: String::new(),
             node_bind: "127.0.0.1:9002".to_string(),
-            max_peers: 10,
-            run_node_enabled: true,
+            max_peers: 50,
             networking_started: false,
             networking_started_at: None,
             peers_arc: Arc::clone(&peers_arc),
@@ -401,7 +399,6 @@ impl DavpApp {
             peers: self.peers.clone(),
             node_bind: self.node_bind.clone(),
             max_peers: self.max_peers,
-            run_node_enabled: self.run_node_enabled,
 
             cnt_enabled: self.cnt_enabled,
             cnt_selected_addr: self.cnt_selected_addr.clone(),
@@ -431,7 +428,6 @@ impl DavpApp {
         self.peers = cfg.peers.clone();
         self.node_bind = cfg.node_bind.clone();
         self.max_peers = cfg.max_peers;
-        self.run_node_enabled = cfg.run_node_enabled;
         self.cnt_enabled = cfg.cnt_enabled;
 
         self.cnt_trackers = cfg.cnt_trackers.clone();
@@ -884,11 +880,10 @@ impl DavpApp {
                     .num_columns(2)
                     .spacing(egui::vec2(12.0, 6.0))
                     .show(ui, |ui| {
-                        ui.label("Max peers / Run node");
+                        ui.label("Max peers");
                         ui.add_enabled_ui(!self.networking_started, |ui| {
                             ui.horizontal(|ui| {
-                                ui.add(egui::DragValue::new(&mut self.max_peers).clamp_range(1..=100));
-                                ui.checkbox(&mut self.run_node_enabled, "Run node");
+                                ui.add(egui::DragValue::new(&mut self.max_peers).clamp_range(50..=usize::MAX));
                             });
                         });
                         ui.end_row();
@@ -1085,20 +1080,18 @@ impl DavpApp {
         let (cnt_enabled_tx, cnt_enabled_rx) = watch::channel(self.cnt_enabled);
         self.cnt_enabled_tx = Some(cnt_enabled_tx);
 
-        if self.run_node_enabled {
-            let storage = Storage::new(self.storage_dir.clone());
-            let config = NodeConfig {
-                bind_addr: bind,
-                peers: Arc::clone(&peers_arc),
-                peer_graph: Arc::clone(&peer_graph),
-            };
+        let storage = Storage::new(self.storage_dir.clone());
+        let config = NodeConfig {
+            bind_addr: bind,
+            peers: Arc::clone(&peers_arc),
+            peer_graph: Arc::clone(&peer_graph),
+        };
 
-            let node_handle = self.rt.spawn(async move {
-                let _ = run_node_with_shutdown(storage, config, node_shutdown_rx).await;
-            });
+        let node_handle = self.rt.spawn(async move {
+            let _ = run_node_with_shutdown(storage, config, node_shutdown_rx).await;
+        });
 
-            self.node_handle = Some(node_handle);
-        }
+        self.node_handle = Some(node_handle);
 
         let mut sync_shutdown_rx_ping = sync_shutdown_rx.clone();
         let cnt_enabled_rx_ping = cnt_enabled_rx.clone();
