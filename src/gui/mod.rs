@@ -64,7 +64,7 @@ fn issuer_unverified_reason(d: &IssuerCertificationDetailed) -> Option<String> {
             Some("Certificate issuer_public_key is invalid base64/length".to_string())
         }
         IssuerCertificationDetailed::IssuerKeyMismatch => Some(
-            "Issuer key mismatch: proof.creator_public_key != certificate.issuer_public_key (you signed the proof with the wrong keypair)"
+            "Issuer key mismatch" // proof.creator_public_key != certificate.issuer_public_key (you signed the proof with the wrong keypair)
                 .to_string(),
         ),
     }
