@@ -14,12 +14,11 @@ use davp::modules::network::{
     replicate_published_proof, replicate_proof,
     run_node_with_shutdown, NodeConfig, PeerConnections, ping_peer,
 };
-use davp::modules::settings::AppConfig;
+use davp::modules::settings::{AppConfig, CntTrackerEntry};
 use davp::modules::storage::Storage;
 use davp::modules::verification::verify_proof;
 use davp::KeypairBytes;
 use eframe::egui;
-use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -28,18 +27,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio::sync::RwLock;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct CntTrackerEntry {
-    name: String,
-    addr: String,
-}
-
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-struct GuiSettingsFile {
-    cnt_selected_addr: Option<String>,
-    cnt_trackers: Vec<CntTrackerEntry>,
-}
 
 #[derive(Debug, Clone)]
 struct VerifyResultView {
@@ -85,7 +72,7 @@ fn issuer_unverified_reason(d: &IssuerCertificationDetailed) -> Option<String> {
 fn main() -> Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size(egui::vec2(700.0, 720.0)),
+            .with_inner_size(egui::vec2(700.0, 500.0)),
         ..Default::default()
     };
     eframe::run_native(
@@ -175,6 +162,8 @@ struct DavpApp {
     certs_bundle_cache_at: Option<Instant>,
 
     last_error: String,
+
+    last_saved_config: Option<AppConfig>,
 }
 
 impl Default for DavpApp {
@@ -251,9 +240,10 @@ impl Default for DavpApp {
             certs_bundle_cache_at: None,
 
             last_error: String::new(),
+
+            last_saved_config: None,
         };
         s.load_app_config();
-        s.load_gui_settings();
         s
     }
 }
@@ -337,6 +327,8 @@ impl eframe::App for DavpApp {
                 Tab::Misc => self.ui_misc(ui),
             }
         });
+
+        self.autosave_app_config();
     }
 }
 
@@ -400,59 +392,96 @@ impl DavpApp {
         });
     }
 
-    fn settings_path(&self) -> PathBuf {
-        PathBuf::from(self.storage_dir.trim()).join("gui_settings.json")
+    fn current_app_config_snapshot(&self) -> AppConfig {
+        let mut cfg = AppConfig::default();
+
+        cfg.data_storage_location = self.storage_dir.trim().to_string();
+        cfg.auto_save = true;
+
+        cfg.peers = self.peers.clone();
+        cfg.node_bind = self.node_bind.clone();
+        cfg.max_peers = self.max_peers;
+        cfg.run_node_enabled = self.run_node_enabled;
+
+        cfg.cnt_enabled = self.cnt_enabled;
+        cfg.cnt_selected_addr = self.cnt_selected_addr.clone();
+        cfg.cnt_trackers = self.cnt_trackers.clone();
+
+        cfg.certs_url = self.certs_url.clone();
+
+        cfg.keypair_base64 = self.keypair_base64.clone();
+        cfg.create_file_path = self.create_file_path.clone();
+        cfg.create_asset_type = self.create_asset_type.clone();
+        cfg.create_ai_assisted = self.create_ai_assisted;
+        cfg.create_description = self.create_description.clone();
+        cfg.create_tags = self.create_tags.clone();
+        cfg.create_parent_verification_id = self.create_parent_verification_id.clone();
+        cfg.create_issuer_certificate_id = self.create_issuer_certificate_id.clone();
+
+        cfg.verify_verification_id = self.verify_verification_id.clone();
+        cfg.verify_file_path = self.verify_file_path.clone();
+
+        cfg
     }
 
-    fn load_gui_settings(&mut self) {
-        let path = self.settings_path();
-        let Ok(bytes) = std::fs::read(&path) else {
-            self.cnt_selected_addr = "127.0.0.1:9100".to_string();
-            self.cnt_server = self.cnt_selected_addr.clone();
-            self.certs_url = DEFAULT_CERTS_URL.to_string();
-            return;
-        };
-        let Ok(s) = String::from_utf8(bytes) else {
-            self.cnt_selected_addr = "127.0.0.1:9100".to_string();
-            self.cnt_server = self.cnt_selected_addr.clone();
-            return;
-        };
-        let Ok(settings) = serde_json::from_str::<GuiSettingsFile>(&s) else {
-            self.cnt_selected_addr = "127.0.0.1:9100".to_string();
-            self.cnt_server = self.cnt_selected_addr.clone();
-            self.certs_url = DEFAULT_CERTS_URL.to_string();
-            return;
-        };
-        self.cnt_trackers = settings.cnt_trackers;
-        if let Some(addr) = settings.cnt_selected_addr {
-            if self
+    fn apply_app_config(&mut self, cfg: &AppConfig) {
+        if !cfg.data_storage_location.trim().is_empty() {
+            self.storage_dir = cfg.data_storage_location.clone();
+        }
+
+        self.peers = cfg.peers.clone();
+        self.node_bind = cfg.node_bind.clone();
+        self.max_peers = cfg.max_peers;
+        self.run_node_enabled = cfg.run_node_enabled;
+        self.cnt_enabled = cfg.cnt_enabled;
+
+        self.cnt_trackers = cfg.cnt_trackers.clone();
+
+        let candidate = cfg.cnt_selected_addr.trim();
+        if !candidate.is_empty()
+            && self
                 .all_cnt_trackers()
                 .iter()
-                .any(|(_, a)| a.trim() == addr.trim())
-            {
-                self.cnt_selected_addr = addr;
-            } else {
-                self.cnt_selected_addr = "127.0.0.1:9100".to_string();
-            }
+                .any(|(_, a)| a.trim() == candidate)
+        {
+            self.cnt_selected_addr = candidate.to_string();
         } else {
             self.cnt_selected_addr = "127.0.0.1:9100".to_string();
         }
         self.cnt_server = self.cnt_selected_addr.clone();
 
-        self.certs_url = DEFAULT_CERTS_URL.to_string();
+        if !cfg.certs_url.trim().is_empty() {
+            self.certs_url = cfg.certs_url.clone();
+        }
+
+        self.keypair_base64 = cfg.keypair_base64.clone();
+        self.create_file_path = cfg.create_file_path.clone();
+        self.create_asset_type = cfg.create_asset_type.clone();
+        self.create_ai_assisted = cfg.create_ai_assisted;
+        self.create_description = cfg.create_description.clone();
+        self.create_tags = cfg.create_tags.clone();
+        self.create_parent_verification_id = cfg.create_parent_verification_id.clone();
+        self.create_issuer_certificate_id = cfg.create_issuer_certificate_id.clone();
+
+        self.verify_verification_id = cfg.verify_verification_id.clone();
+        self.verify_file_path = cfg.verify_file_path.clone();
     }
 
-    fn save_gui_settings(&self) -> std::result::Result<(), String> {
-        let base = PathBuf::from(self.storage_dir.trim());
-        std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
-        let path = self.settings_path();
-        let settings = GuiSettingsFile {
-            cnt_selected_addr: Some(self.cnt_selected_addr.clone()),
-            cnt_trackers: self.cnt_trackers.clone(),
-        };
-        let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
-        std::fs::write(&path, json).map_err(|e| e.to_string())?;
-        Ok(())
+    fn autosave_app_config(&mut self) {
+        let snapshot = self.current_app_config_snapshot();
+
+        if self
+            .last_saved_config
+            .as_ref()
+            .is_some_and(|prev| *prev == snapshot)
+        {
+            return;
+        }
+
+        let path = AppConfig::path_in_repo_root();
+        if snapshot.save(&path).is_ok() {
+            self.last_saved_config = Some(snapshot);
+        }
     }
 
     fn export_app_config_to_path(&mut self, selected: &std::path::Path) -> std::result::Result<(), String> {
@@ -554,7 +583,7 @@ impl DavpApp {
                 });
 
                 if self.storage_dir.trim() != old_storage_dir.trim() {
-                    self.save_app_config_storage_dir();
+                    self.autosave_app_config();
                 }
 
                 ui.add_space(2.0);
@@ -595,9 +624,7 @@ impl DavpApp {
                     if new_addr.trim() != self.cnt_selected_addr.trim() {
                         self.cnt_selected_addr = new_addr;
                         self.cnt_server = self.cnt_selected_addr.clone();
-                        if let Err(e) = self.save_gui_settings() {
-                            self.last_error = e;
-                        }
+                        self.autosave_app_config();
                     }
                     if ui.button("Refresh certs").clicked() {
                         let _ = self.fetch_certs_bundle_for_verify(true);
@@ -623,9 +650,8 @@ impl DavpApp {
     fn load_app_config(&mut self) {
         let path = AppConfig::path_in_repo_root();
         if let Ok(cfg) = AppConfig::load_or_create(&path) {
-            if !cfg.data_storage_location.trim().is_empty() {
-                self.storage_dir = cfg.data_storage_location;
-            }
+            self.apply_app_config(&cfg);
+            self.last_saved_config = Some(cfg);
         }
     }
 
@@ -637,17 +663,9 @@ impl DavpApp {
         let root_path = AppConfig::path_in_repo_root();
         cfg.save(&root_path).map_err(|e| e.to_string())?;
 
-        // Apply immediately in the GUI
-        if !cfg.data_storage_location.trim().is_empty() {
-            self.storage_dir = cfg.data_storage_location;
-        }
+        self.apply_app_config(&cfg);
+        self.last_saved_config = Some(cfg);
         Ok(())
-    }
-
-    fn save_app_config_storage_dir(&mut self) {
-        let path = AppConfig::path_in_repo_root();
-        let mut cfg = AppConfig::load_or_create(&path).unwrap_or_default();
-        let _ = cfg.set_data_storage_location(&path, self.storage_dir.trim().to_string());
     }
 
     fn fetch_certs_bundle_for_verify(
@@ -867,8 +885,6 @@ impl DavpApp {
                     .num_columns(2)
                     .spacing(egui::vec2(12.0, 6.0))
                     .show(ui, |ui| {
-                        
-
                         ui.label("Max peers / Run node");
                         ui.add_enabled_ui(!self.networking_started, |ui| {
                             ui.horizontal(|ui| {
@@ -929,23 +945,18 @@ impl DavpApp {
 
                                 let new_addr = trackers
                                     .get(selected)
-                                    .map(|t| t.1.clone())
+                                    .map(|(_, addr)| addr.clone())
                                     .unwrap_or_else(|| "127.0.0.1:9100".to_string());
                                 if new_addr.trim() != self.cnt_selected_addr.trim() {
                                     self.cnt_selected_addr = new_addr;
                                     self.cnt_server = self.cnt_selected_addr.clone();
-                                    if let Err(e) = self.save_gui_settings() {
-                                        self.last_error = e;
-                                    }
+                                    self.autosave_app_config();
                                 }
                             });
-
-                            if self.networking_started {
-                                ui.monospace(self.cnt_selected_addr.trim());
-                            }
                         });
                         ui.end_row();
                     });
+                });
 
                 ui.add_space(6.0);
 
@@ -1036,7 +1047,6 @@ impl DavpApp {
                                 });
                         }
                     });
-            });
         });
     }
 

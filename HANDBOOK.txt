@@ -5,10 +5,11 @@ DAVP is a program and protocol implementation for creating, storing, verifying, 
 
 The repository provides:
 - A CLI application (src/main.rs)
-- A GUI application (src/bin/davp_gui.rs)
+- A GUI application (src/bin/davp_gui.rs), launched via the CLI using --gui
 - A local filesystem storage layer (src/modules/storage.rs)
 - A simple peer-to-peer TCP networking layer for replication and lookup (src/modules/network.rs)
 - Optional issuer certificate verification using a remotely-fetched certs.json (src/modules/issuer_certificate.rs)
+- A CNT tracker / bootstrap server binary (bootstrap_server)
 
 1.2 What problem it solves
 DAVP solves the problem of verifiable, offline-checkable attribution of a specific content hash to a specific Ed25519 public key at a specific time, along with attached metadata. It allows:
@@ -24,6 +25,26 @@ DAVP does not implement:
 - Global immutability guarantees across the network
 - Truth claims about the metadata or real-world identity of a key
 - A global namespace or authority for verification IDs
+
+1.4 How to run (quick)
+
+CLI (from the repo root):
+- Key generation:
+  - cargo run -- keygen
+- Create a proof:
+  - cargo run -- create --file <path> --keypair_base64 <base64> --asset_type other --ai_assisted false --storage_dir davp_storage
+- Verify a proof (from local storage):
+  - cargo run -- verify --verification_id <id> --storage_dir davp_storage
+- Verify and also check the file hash:
+  - cargo run -- verify --verification_id <id> --file <path> --storage_dir davp_storage
+- Run a node:
+  - cargo run -- node --bind 127.0.0.1:9002 --storage_dir davp_storage --peers 127.0.0.1:9003
+
+GUI:
+- cargo run -- --gui
+
+CNT tracker server (bootstrap server):
+- cargo run -p davp_bootstrap_server -- --bind 0.0.0.0:9100
 
 2) Core concepts
 
@@ -96,8 +117,17 @@ After creation, proofs are stored in a local directory selected by the user (sto
 Stored items:
 - Proof is stored as bincode bytes in <storage_dir>/<verification_id>.bin
 - Optional metadata is stored as bincode bytes in <storage_dir>/<verification_id>.meta.bin
+- A hash index is stored in <storage_dir>/hash_index.bin
 
-The files are created by writing full new files. DAVP does not implement in-place updates to existing proof files.
+The files are created by writing full new files.
+
+Overwrite behavior:
+- If a file already exists and the bytes are identical, writing is treated as a no-op.
+- If a file already exists and the bytes differ, DAVP refuses to overwrite (to avoid corrupting data).
+
+Published proof metadata:
+- Metadata file (<verification_id>.meta.bin) is only written when issuer_certificate_id is Some(...).
+- If issuer_certificate_id is None, the absence of the metadata file represents the default state.
 
 3.3 Optional publication / replication
 DAVP supports optional “publication” by storing an associated issuer_certificate_id (if provided) alongside the proof.
@@ -141,6 +171,10 @@ The bundle can be either:
 - A JSON array of certificates, or
 - An object containing a "certificates" field, optionally with a default ca_public_key_base64.
 
+CA public key selection:
+- If the certificate has ca_public_key_base64, it overrides the bundle-level ca_public_key_base64.
+- If neither is present, issuer certificate verification cannot certify the issuer.
+
 5.3 Certificate validation rules
 For a certificate_id to certify a proof creator key, DAVP checks:
 1) The certificate with matching certificate_id exists in the bundle.
@@ -170,6 +204,10 @@ A node:
 - Handles exactly one message per connection in the current implementation
 - Stores received proofs locally and replicates them to known peers
 
+Message framing:
+- Each message is length-prefixed as a u32 little-endian, followed by bincode bytes.
+- Networking operations use short timeouts (200ms) for connect/read/write in the current implementation.
+
 6.2 Message types
 Network message types (src/modules/network.rs) include:
 - PushProof(Proof)
@@ -192,12 +230,21 @@ Replication rules (src/modules/network.rs):
   - Store published metadata
   - Forward to known peers
 
+Published replication:
+- When actively replicating a PublishedProof, DAVP sends both:
+  - PushPublishedProof(published)
+  - PushProof(published.proof)
+
 The network layer does not enforce global ordering, uniqueness, or consensus.
 
 6.4 CNT bootstrap role (discovery only, not authority)
-DAVP contains a tracker-report mechanism (bootstrap.rs / cnt.rs) used for peer discovery:
+DAVP contains a tracker-report mechanism (bootstrap.rs) used for peer discovery:
 - A node can report its address, known peers, and connected peers to a tracker server.
 - The tracker responds with a list of peer entries.
+
+Tracker server:
+- The repository includes a separate binary (bootstrap_server) which runs a CNT tracker server.
+- It defaults to bind 0.0.0.0:9100 and has a TUI (press q to quit), with headless fallback.
 
 This mechanism is discovery-only:
 - It does not sign or certify proofs.
@@ -269,3 +316,14 @@ Offline verification is supported as long as the verifying party has:
 - Optionally the asset bytes to perform the hash check
 
 Issuer certificate checks require access to the certificate bundle unless the verifier provides it separately (the code can parse certificates from a string, but the GUI/CLI default path is network fetch).
+
+10) Configuration (config.json)
+
+DAVP uses a JSON config file:
+- config.json is stored next to the running executable (see AppConfig::path_in_repo_root).
+
+Fields:
+- data_storage_location: string path for the default storage directory (default: davp_storage)
+- auto_save: boolean controlling whether changes are written immediately
+
+The GUI exposes import/open-folder helpers for config.json and storage folders.
