@@ -72,35 +72,28 @@ jobs:
           mkdir -p "$APPDIR/usr/bin"
           cp -f target/release/davp "$APPDIR/usr/bin/"
 
-          cat > "$APPDIR/davp.desktop" <<'EOF'
-[Desktop Entry]
-Type=Application
-Name=DAVP
-Exec=davp
-Icon=davp
-Categories=Utility;
-Terminal=true
-EOF
+          cat <<'EOF' | sed 's/^          //' > "$APPDIR/davp.desktop"
+          [Desktop Entry]
+          Type=Application
+          Name=DAVP
+          Exec=davp
+          Icon=davp
+          Categories=Utility;
+          Terminal=true
+          EOF
 
-          cat > "$APPDIR/davp.svg" <<'EOF'
-<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
-  <rect width="256" height="256" rx="48" fill="#111827"/>
-  <text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle" font-size="72" font-family="Arial, sans-serif" fill="#ffffff">DAVP</text>
-</svg>
-EOF
+          cat <<'EOF' | sed 's/^          //' > "$APPDIR/davp.svg"
+          <svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+            <rect width="256" height="256" rx="48" fill="#111827"/>
+            <text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle" font-size="72" font-family="Arial, sans-serif" fill="#ffffff">DAVP</text>
+          </svg>
+          EOF
 
-<<<<<<< HEAD
-          echo '#!/bin/sh
-HERE="$(dirname "$(readlink -f "$0")")"
-exec "${HERE}/usr/bin/davp" "$@"' > "$APPDIR/AppRun"
-=======
-          cat > "$APPDIR/AppRun" <<'EOF'
-echo '#!/bin/sh
-HERE="$(dirname "$(readlink -f "$0")")"
-exec "${HERE}/usr/bin/davp" "$@"' > "$APPDIR/AppRun"
-chmod +x "$APPDIR/AppRun"
-
->>>>>>> b910693f68d216a8bfef132dd4d6ce5138d3d973
+          cat <<'EOF' | sed 's/^          //' > "$APPDIR/AppRun"
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "${HERE}/usr/bin/davp" "$@"
+          EOF
           chmod +x "$APPDIR/AppRun"
 
           curl -L -o appimagetool "https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage"
