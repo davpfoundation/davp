@@ -6,6 +6,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
 
+const IO_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerReport {
     pub addr: SocketAddr,
@@ -41,7 +43,7 @@ pub async fn report_and_get_peers(
     server: SocketAddr,
     report: PeerReport,
 ) -> Result<(Vec<PeerEntry>, bool)> {
-    let mut stream = timeout(Duration::from_millis(200), TcpStream::connect(server)).await??;
+    let mut stream = timeout(IO_TIMEOUT, TcpStream::connect(server)).await??;
     write_message(&mut stream, &Message::Report(report)).await?;
 
     match read_message(&mut stream).await? {
@@ -53,15 +55,15 @@ pub async fn report_and_get_peers(
 async fn write_message(stream: &mut TcpStream, msg: &Message) -> Result<()> {
     let bytes = bincode::serialize(msg)?;
     let len = bytes.len() as u32;
-    timeout(Duration::from_millis(200), stream.write_u32_le(len)).await??;
-    timeout(Duration::from_millis(200), stream.write_all(&bytes)).await??;
-    timeout(Duration::from_millis(200), stream.flush()).await??;
+    timeout(IO_TIMEOUT, stream.write_u32_le(len)).await??;
+    timeout(IO_TIMEOUT, stream.write_all(&bytes)).await??;
+    timeout(IO_TIMEOUT, stream.flush()).await??;
     Ok(())
 }
 
 async fn read_message(stream: &mut TcpStream) -> Result<Message> {
-    let len = timeout(Duration::from_millis(200), stream.read_u32_le()).await?? as usize;
+    let len = timeout(IO_TIMEOUT, stream.read_u32_le()).await?? as usize;
     let mut buf = vec![0u8; len];
-    timeout(Duration::from_millis(200), stream.read_exact(&mut buf)).await??;
+    timeout(IO_TIMEOUT, stream.read_exact(&mut buf)).await??;
     Ok(bincode::deserialize::<Message>(&buf)?)
 }
