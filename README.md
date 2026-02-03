@@ -6,7 +6,7 @@ Decentralized Asset Verification Protocol. DAVP is a program and protocol implem
 
 ## Demonstration
 <p align="center">
-  <img src="https://raw.githubusercontent.com/davpfoundation/davp/refs/heads/main/docs/davp_demo.png">
+  <img src="https://raw.githubusercontent.com/davpfoundation/davp/refs/heads/main/docs/davp_demonstration.png">
 </p>
 <p align="center"><i>Demo representation of DAVP in GUI mode</i></p>
 
