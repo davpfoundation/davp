@@ -2,11 +2,11 @@ use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clap::{CommandFactory, Parser, Subcommand};
 use davp::modules::asset::create_proof_from_bytes;
-use davp::modules::bootstrap::{report_and_get_peers, PeerEntry, PeerReport};
+use davp::modules::bootstrap::{report_and_get_peers, PeerReport};
 use davp::modules::certification::PublishedProof;
 use davp::modules::issuer_certificate::{
-    fetch_certificate_bundle, fetch_certificates, parse_certificates_json,
-    verify_issuer_certificate, IssuerCertificationStatus, DEFAULT_CERTS_URL,
+    fetch_certificate_bundle, fetch_certificates, parse_certificates_json, verify_issuer_certificate,
+    IssuerCertificationStatus, DEFAULT_CERTS_URL,
 };
 use davp::modules::metadata::{AssetType, Metadata};
 use davp::modules::network::{
@@ -101,6 +101,9 @@ enum Commands {
         #[arg(long)]
         bind: SocketAddr,
 
+        #[arg(long)]
+        public_ip: std::net::IpAddr,
+
         #[arg(long, default_value = "davp_storage")]
         storage_dir: PathBuf,
 
@@ -113,6 +116,20 @@ enum Commands {
         #[arg(long, default_value_t = 10)]
         max_peers: usize,
     },
+}
+
+fn rewrite_192_168_to_public_ip(addr: SocketAddr, public_ip: std::net::IpAddr) -> SocketAddr {
+    match addr.ip() {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            if o[0] == 192 && o[1] == 168 {
+                SocketAddr::new(public_ip, addr.port())
+            } else {
+                addr
+            }
+        }
+        std::net::IpAddr::V6(_) => addr,
+    }
 }
 
 fn parse_asset_type(s: &str) -> Result<AssetType> {
@@ -496,6 +513,7 @@ async fn cli_main(cli: Cli) -> Result<()> {
         }
         Commands::Node {
             bind,
+            public_ip,
             storage_dir,
             peers,
             bootstrap_server,
@@ -510,6 +528,7 @@ async fn cli_main(cli: Cli) -> Result<()> {
             if let Some(server) = bootstrap_server {
                 let peers_for_task = Arc::clone(&peers_arc);
                 let peer_graph_for_task = Arc::clone(&peer_graph);
+                let advertised_for_cnt = rewrite_192_168_to_public_ip(bind, public_ip);
 
                 // Peer ping/gossip loop (fast path)
                 let peers_for_ping = Arc::clone(&peers_for_task);
@@ -560,7 +579,7 @@ async fn cli_main(cli: Cli) -> Result<()> {
 
                         while let Some(join_res) = join_set.join_next().await {
                             match join_res {
-                                Ok((peer, Ok((peer_list, conn_graph)))) => {
+                                Ok((peer, Ok((peer_list, conn_graph, _observed_addr)))) => {
                                     connected.push(peer);
 
                                     for p in peer_list {
@@ -646,12 +665,12 @@ async fn cli_main(cli: Cli) -> Result<()> {
                         };
 
                         let report = PeerReport {
-                            addr: bind,
+                            addr: advertised_for_cnt,
                             known_peers: connected.clone(),
                             connected_peers: connected,
                         };
 
-                        let Ok((entries, requester_stable)) =
+                        let Ok((entries, requester_stable, _requester_effective_addr)) =
                             report_and_get_peers(server, report).await
                         else {
                             continue;
@@ -689,8 +708,22 @@ async fn cli_main(cli: Cli) -> Result<()> {
 
             let config = NodeConfig {
                 bind_addr: bind,
+                advertise_addr: std::sync::Arc::new(std::sync::Mutex::new(
+                    rewrite_192_168_to_public_ip(
+                        if bind.ip().is_unspecified() {
+                            std::net::SocketAddr::new(
+                                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                                bind.port(),
+                            )
+                        } else {
+                            bind
+                        },
+                        public_ip,
+                    ),
+                )),
                 peers: peers_arc,
                 peer_graph,
+                last_inbound: std::sync::Arc::new(std::sync::Mutex::new(None)),
             };
 
             run_node(storage, config).await

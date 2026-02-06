@@ -25,6 +25,12 @@ pub struct AppConfig {
     #[serde(default, skip_serializing)]
     pub node_bind: String,
 
+    #[serde(default, skip_serializing)]
+    pub advertise_addr: String,
+
+    #[serde(default, skip_serializing)]
+    pub upnp_enabled: bool,
+
     #[serde(default = "default_max_peers", skip_serializing)]
     pub max_peers: usize,
 
@@ -87,7 +93,9 @@ impl Default for AppConfig {
             auto_save: true,
 
             peers: String::new(),
-            node_bind: "127.0.0.1:9002".to_string(),
+            node_bind: "0.0.0.0:9001".to_string(),
+            advertise_addr: String::new(),
+            upnp_enabled: false,
             max_peers: default_max_peers(),
             cnt_enabled: false,
             cnt_selected_addr: default_cnt_selected_addr(),

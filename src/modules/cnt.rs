@@ -6,7 +6,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
 
-const IO_TIMEOUT: Duration = Duration::from_secs(2);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerReport {
@@ -30,6 +31,7 @@ pub struct PeerEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeersResponse {
     pub requester_stable: bool,
+    pub requester_effective_addr: SocketAddr,
     pub entries: Vec<PeerEntry>,
 }
 
@@ -42,13 +44,13 @@ enum Message {
 pub async fn report_and_get_peers(
     server: SocketAddr,
     report: PeerReport,
-) -> Result<(Vec<PeerEntry>, bool)> {
-    let mut stream = timeout(IO_TIMEOUT, TcpStream::connect(server)).await??;
+) -> Result<(Vec<PeerEntry>, bool, SocketAddr)> {
+    let mut stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(server)).await??;
     write_message(&mut stream, &Message::Report(report)).await?;
 
     match read_message(&mut stream).await? {
-        Message::Peers(res) => Ok((res.entries, res.requester_stable)),
-        _ => Ok((Vec::new(), false)),
+        Message::Peers(res) => Ok((res.entries, res.requester_stable, res.requester_effective_addr)),
+        _ => Ok((Vec::new(), false, server)),
     }
 }
 

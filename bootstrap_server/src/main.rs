@@ -9,6 +9,7 @@ use davp_bootstrap_server::start_server_with_shutdown;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Row, Table};
 use std::io::{stdout, Stdout};
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::signal;
@@ -20,8 +21,20 @@ struct Cli {
     #[arg(long, default_value = "0.0.0.0:9100")]
     bind: SocketAddr,
 
-    #[arg(long, default_value_t = 5)]
+    #[arg(long)]
+    public_ip: IpAddr,
+
+    #[arg(long, default_value_t = 60)]
     ttl_seconds: i64,
+
+    #[arg(long, default_value_t = true, help = "Allow loopback/private addresses for local testing")] 
+    allow_loopback: bool,
+
+    #[arg(long, default_value_t = false, help = "Run a libp2p gossipsub hub for NAT-friendly proof propagation")]
+    p2p_hub: bool,
+
+    #[arg(long, default_value = "0.0.0.0:4002", help = "Bind address for the libp2p hub (tcp)")]
+    p2p_bind: SocketAddr,
 }
 
 #[tokio::main]
@@ -29,7 +42,24 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let server = start_server_with_shutdown(cli.bind, cli.ttl_seconds, shutdown_rx).await?;
+    let server = start_server_with_shutdown(
+        cli.bind,
+        cli.ttl_seconds,
+        shutdown_rx.clone(),
+        cli.allow_loopback,
+        Some(cli.public_ip),
+    )
+    .await?;
+
+    let p2p_handle = if cli.p2p_hub {
+        let mut shutdown_rx_p2p = shutdown_rx.clone();
+        let bind = cli.p2p_bind;
+        Some(tokio::spawn(async move {
+            let _ = davp_bootstrap_server::run_p2p_hub(bind, &mut shutdown_rx_p2p).await;
+        }))
+    } else {
+        None
+    };
 
     let tui_setup = (|| -> Result<Terminal<CrosstermBackend<Stdout>>> {
         enable_raw_mode()?;
@@ -56,6 +86,9 @@ async fn main() -> Result<()> {
     };
 
     let _ = shutdown_tx.send(true);
+    if let Some(h) = p2p_handle {
+        let _ = h.await;
+    }
     res
 }
 

@@ -17,11 +17,13 @@ ed25519-dalek = { version = "1", features = ["rand"] }
 eframe = "0.26"
 rand = "0.7"
 reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+libp2p = { version = "0.53", default-features = false, features = ["tokio", "tcp", "dns", "identify", "kad", "gossipsub", "yamux", "noise", "serde", "macros"] }
+futures = "0.3"
+igd-next = { version = "0.14", features = ["aio_tokio"] }
 rfd = "0.14"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
-davp_bootstrap_server = { path = "bootstrap_server" }
 
 [[bin]]
 name = "davp"

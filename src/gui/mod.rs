@@ -1,6 +1,7 @@
 use anyhow::Result;
 use base64::Engine as _;
 use crate::modules::asset::create_proof_from_bytes;
+use crate::modules::asset::Proof;
 use crate::modules::bootstrap::{report_and_get_peers, PeerEntry, PeerReport};
 use crate::modules::certification::PublishedProof;
 use crate::modules::hash::blake3_hash_bytes;
@@ -10,23 +11,48 @@ use crate::modules::issuer_certificate::{
 };
 use crate::modules::metadata::{AssetType, Metadata};
 use crate::modules::network::{
-    fetch_ids_by_hash_from_peers, fetch_proof_from_peers, fetch_published_proof_from_peers,
-    replicate_published_proof, replicate_proof,
-    run_node_with_shutdown, NodeConfig, PeerConnections, ping_peer,
+    connected_session_peers, fetch_proof_from_peers, fetch_published_proof_from_peers,
+    ping_peer_detailed, replicate_proof, replicate_published_proof, run_node_with_shutdown,
+    NodeConfig, PeerConnections,
 };
 use crate::modules::settings::{AppConfig, CntTrackerEntry};
 use crate::modules::storage::Storage;
 use crate::modules::verification::verify_proof;
+use crate::p2p::{run_p2p, OutboundMsg};
 use crate::KeypairBytes;
 use eframe::egui;
+use igd_next::aio::tokio as igd_tokio;
+use igd_next::{PortMappingProtocol, SearchOptions};
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::net::IpAddr;
+use std::net::Ipv4Addr;
+use std::net::UdpSocket;
 use std::path::PathBuf;
 use std::process::Command;
+use tokio::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio::sync::RwLock;
+
+#[derive(Debug, Clone)]
+enum GuiTaskMsg {
+    CreateDone {
+        verification_id: String,
+        creator_public_key_base64: String,
+        signature_base64: String,
+        issuer_certificate_id_display: String,
+    },
+    VerifyDone {
+        status: String,
+        view: Option<VerifyResultView>,
+    },
+    TaskError {
+        message: String,
+    },
+}
 
 #[derive(Debug, Clone)]
 struct VerifyResultView {
@@ -38,6 +64,22 @@ struct VerifyResultView {
     issuer_certified: bool,
     organization_name: Option<String>,
     issuer_unverified_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PeerDialStatus {
+    last_attempt: Option<Instant>,
+    last_result: Option<Instant>,
+    last_duration_ms: Option<u128>,
+    last_ok: Option<Instant>,
+    last_stage: Option<String>,
+    last_stage_msg: Option<String>,
+    last_error: Option<String>,
+    ok_count: u64,
+    err_count: u64,
+    consecutive_failures: u32,
+    failure_score: u64,
+    last_score_decay: Option<Instant>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -68,6 +110,19 @@ fn issuer_unverified_reason(d: &IssuerCertificationDetailed) -> Option<String> {
                 .to_string(),
         ),
     }
+}
+
+fn drop_default_port_dupes(peers: &mut Vec<SocketAddr>) {
+    let mut has_non_default: HashSet<IpAddr> = HashSet::new();
+    for p in peers.iter() {
+        if p.port() != 9001 {
+            has_non_default.insert(p.ip());
+        }
+    }
+    if has_non_default.is_empty() {
+        return;
+    }
+    peers.retain(|p| !(p.port() == 9001 && has_non_default.contains(&p.ip())));
 }
 
 pub fn run_gui() -> Result<()> {
@@ -106,7 +161,17 @@ struct DavpApp {
     cnt_new_name: String,
     cnt_new_addr: String,
 
+    node_port: u16,
+    node_port_text: String,
+    detected_ip: IpAddr,
+    observed_public_ip: Arc<Mutex<Option<IpAddr>>>,
+
     node_bind: String,
+    advertise_addr: String,
+    upnp_enabled: bool,
+    upnp_status_line: Arc<Mutex<String>>,
+    upnp_external_ip: Arc<Mutex<Option<IpAddr>>>,
+    upnp_mapped_addr: Arc<Mutex<Option<SocketAddr>>>,
     max_peers: usize,
 
     networking_started: bool,
@@ -118,7 +183,9 @@ struct DavpApp {
     bootstrap_entries: Arc<Mutex<Vec<PeerEntry>>>,
     reachable_peers: Arc<Mutex<Vec<SocketAddr>>>,
     recent_peer_hits: Arc<Mutex<HashMap<SocketAddr, Instant>>>,
+    dial_diagnostics: Arc<Mutex<HashMap<SocketAddr, PeerDialStatus>>>,
     cnt_ui_status: Arc<Mutex<CntUiStatus>>,
+    last_inbound: Arc<Mutex<Option<Instant>>>,
     tasks_started: bool,
 
     node_shutdown_tx: Option<watch::Sender<bool>>,
@@ -127,6 +194,10 @@ struct DavpApp {
     cnt_handle: Option<tokio::task::JoinHandle<()>>,
     sync_shutdown_tx: Option<watch::Sender<bool>>,
     cnt_enabled_tx: Option<watch::Sender<bool>>,
+
+    p2p_shutdown_tx: Option<watch::Sender<bool>>,
+    p2p_handle: Option<tokio::task::JoinHandle<()>>,
+    p2p_outbound_tx: Option<mpsc::UnboundedSender<OutboundMsg>>,
 
     rt: tokio::runtime::Runtime,
 
@@ -147,8 +218,10 @@ struct DavpApp {
     created_signature_base64: String,
     created_issuer_certificate_id_display: String,
     create_modal_open: bool,
+    create_in_progress: bool,
 
     verify_modal_open: bool,
+    verify_in_progress: bool,
 
     // verify
     verify_verification_id: String,
@@ -164,6 +237,9 @@ struct DavpApp {
     last_error: String,
 
     last_saved_config: Option<AppConfig>,
+
+    gui_task_tx: mpsc::UnboundedSender<GuiTaskMsg>,
+    gui_task_rx: mpsc::UnboundedReceiver<GuiTaskMsg>,
 }
 
 impl Default for DavpApp {
@@ -171,9 +247,17 @@ impl Default for DavpApp {
         let peers_arc: Arc<RwLock<Vec<SocketAddr>>> = Arc::new(RwLock::new(Vec::new()));
         let peer_graph: Arc<RwLock<HashMap<SocketAddr, Vec<SocketAddr>>>> = Arc::new(RwLock::new(HashMap::new()));
         let recent_peer_hits: Arc<Mutex<HashMap<SocketAddr, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
+        let dial_diagnostics: Arc<Mutex<HashMap<SocketAddr, PeerDialStatus>>> = Arc::new(Mutex::new(HashMap::new()));
         let cnt_ui_status: Arc<Mutex<CntUiStatus>> = Arc::new(Mutex::new(CntUiStatus::default()));
-        let mut s = Self {
-            tab: Tab::default(),
+        let observed_public_ip: Arc<Mutex<Option<IpAddr>>> = Arc::new(Mutex::new(None));
+        let upnp_status_line: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+        let upnp_external_ip: Arc<Mutex<Option<IpAddr>>> = Arc::new(Mutex::new(None));
+        let upnp_mapped_addr: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+        let last_inbound: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let (gui_task_tx, gui_task_rx) = mpsc::unbounded_channel::<GuiTaskMsg>();
+
+        Self {
+            tab: Tab::Workspace,
             storage_dir: "davp_storage".to_string(),
             config_import_path: String::new(),
             config_export_path: String::new(),
@@ -187,7 +271,18 @@ impl Default for DavpApp {
             cnt_trackers: Vec::new(),
             cnt_new_name: String::new(),
             cnt_new_addr: String::new(),
-            node_bind: "127.0.0.1:9002".to_string(),
+
+            node_port: 9001,
+            node_port_text: "*".to_string(),
+            detected_ip: detect_local_ip().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            observed_public_ip: Arc::clone(&observed_public_ip),
+
+            node_bind: "0.0.0.0:9001".to_string(),
+            advertise_addr: String::new(),
+            upnp_enabled: false,
+            upnp_status_line: Arc::clone(&upnp_status_line),
+            upnp_external_ip: Arc::clone(&upnp_external_ip),
+            upnp_mapped_addr: Arc::clone(&upnp_mapped_addr),
             max_peers: 50,
             networking_started: false,
             networking_started_at: None,
@@ -197,7 +292,9 @@ impl Default for DavpApp {
             bootstrap_entries: Arc::new(Mutex::new(Vec::new())),
             reachable_peers: Arc::new(Mutex::new(Vec::new())),
             recent_peer_hits: Arc::clone(&recent_peer_hits),
+            dial_diagnostics: Arc::clone(&dial_diagnostics),
             cnt_ui_status: Arc::clone(&cnt_ui_status),
+            last_inbound: Arc::clone(&last_inbound),
             tasks_started: false,
             node_shutdown_tx: None,
             node_handle: None,
@@ -205,6 +302,9 @@ impl Default for DavpApp {
             cnt_handle: None,
             sync_shutdown_tx: None,
             cnt_enabled_tx: None,
+            p2p_shutdown_tx: None,
+            p2p_handle: None,
+            p2p_outbound_tx: None,
             rt: tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -225,8 +325,10 @@ impl Default for DavpApp {
             created_signature_base64: String::new(),
             created_issuer_certificate_id_display: String::new(),
             create_modal_open: false,
+            create_in_progress: false,
 
             verify_modal_open: false,
+            verify_in_progress: false,
 
             verify_verification_id: String::new(),
             verify_file_path: String::new(),
@@ -241,9 +343,10 @@ impl Default for DavpApp {
             last_error: String::new(),
 
             last_saved_config: None,
-        };
-        s.load_app_config();
-        s
+
+            gui_task_tx,
+            gui_task_rx,
+        }
     }
 }
 
@@ -251,12 +354,43 @@ impl Default for DavpApp {
 enum Tab {
     #[default]
     Workspace,
-    Misc,
+    Keygen,
 }
 
 impl eframe::App for DavpApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let _ = (&self.config_export_path, &self.cnt_new_name, &self.cnt_new_addr);
+
         ctx.request_repaint_after(Duration::from_millis(100));
+
+        while let Ok(msg) = self.gui_task_rx.try_recv() {
+            match msg {
+                GuiTaskMsg::CreateDone {
+                    verification_id,
+                    creator_public_key_base64,
+                    signature_base64,
+                    issuer_certificate_id_display,
+                } => {
+                    self.create_in_progress = false;
+                    self.create_modal_open = false;
+                    self.created_verification_id = verification_id;
+                    self.created_creator_public_key_base64 = creator_public_key_base64;
+                    self.created_signature_base64 = signature_base64;
+                    self.created_issuer_certificate_id_display = issuer_certificate_id_display;
+                }
+                GuiTaskMsg::VerifyDone { status, view } => {
+                    self.verify_in_progress = false;
+                    self.verify_modal_open = false;
+                    self.verify_status = status;
+                    self.verify_view = view;
+                }
+                GuiTaskMsg::TaskError { message } => {
+                    self.create_in_progress = false;
+                    self.verify_in_progress = false;
+                    self.last_error = message;
+                }
+            }
+        }
 
         egui::TopBottomPanel::top("top")
             .resizable(false)
@@ -264,7 +398,7 @@ impl eframe::App for DavpApp {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.tab, Tab::Workspace, "Workspace");
-                    ui.selectable_value(&mut self.tab, Tab::Misc, "Misc");
+                    ui.selectable_value(&mut self.tab, Tab::Keygen, "Keygen");
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(format!(
@@ -323,7 +457,7 @@ impl eframe::App for DavpApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             match self.tab {
                 Tab::Workspace => self.ui_workspace(ui),
-                Tab::Misc => self.ui_misc(ui),
+                Tab::Keygen => self.ui_keygen(ui),
             }
         });
 
@@ -334,8 +468,37 @@ impl eframe::App for DavpApp {
 impl DavpApp {
     const INPUT_WIDTH: f32 = 560.0;
 
+    fn normalize_node_port_text(&mut self) {
+        let t = self.node_port_text.trim();
+        if t == "*" {
+            self.node_port = 9001;
+            self.recompute_network_addrs();
+            return;
+        }
+        if t.is_empty() {
+            return;
+        }
+        if t.len() > 4 {
+            return;
+        }
+        if let Ok(v) = t.parse::<u16>() {
+            if (1..=9999).contains(&v) {
+                self.node_port = v;
+                self.recompute_network_addrs();
+            }
+        }
+    }
+
+    fn recompute_network_addrs(&mut self) {
+        self.node_bind = format!("0.0.0.0:{}", self.node_port);
+        self.advertise_addr = format!("{}:{}", self.detected_ip, self.node_port);
+    }
+
     fn all_cnt_trackers(&self) -> Vec<(String, String)> {
-        let mut v = vec![("CNT World".to_string(), "cnt.unitedorigins.com:5157".to_string())];
+        let mut v = vec![
+            ("CNT World".to_string(), "cnt.unitedorigins.com:5157".to_string()),
+            ("Local World".to_string(), "127.0.0.1:5157".to_string()),
+        ];
         for t in &self.cnt_trackers {
             v.push((t.name.clone(), t.addr.clone()));
         }
@@ -398,6 +561,8 @@ impl DavpApp {
 
             peers: self.peers.clone(),
             node_bind: self.node_bind.clone(),
+            advertise_addr: self.advertise_addr.clone(),
+            upnp_enabled: self.upnp_enabled,
             max_peers: self.max_peers,
 
             cnt_enabled: self.cnt_enabled,
@@ -426,7 +591,16 @@ impl DavpApp {
         }
 
         self.peers = cfg.peers.clone();
-        self.node_bind = cfg.node_bind.clone();
+        if let Ok(a) = cfg.node_bind.parse::<SocketAddr>() {
+            self.node_port = a.port();
+        }
+        if self.node_port == 9001 {
+            self.node_port_text = "*".to_string();
+        } else {
+            self.node_port_text = self.node_port.to_string();
+        }
+        self.recompute_network_addrs();
+        self.upnp_enabled = cfg.upnp_enabled;
         self.max_peers = cfg.max_peers;
         self.cnt_enabled = cfg.cnt_enabled;
 
@@ -479,6 +653,7 @@ impl DavpApp {
         }
     }
 
+    #[allow(dead_code)]
     fn export_app_config_to_path(&mut self, selected: &std::path::Path) -> std::result::Result<(), String> {
         let root_path = AppConfig::path_in_repo_root();
         let cfg = AppConfig::load_or_create(&root_path).map_err(|e| e.to_string())?;
@@ -633,15 +808,69 @@ impl DavpApp {
         });
     }
 
-    fn ui_misc(&mut self, ui: &mut egui::Ui) {
+    fn ui_keygen(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-            ui.heading("Misc");
+            ui.heading("Keygen");
+
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.heading("Keygenerator");
+                ui.label("Generate a signing keypair. Store the keypair securely; it can create proofs.");
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Generate new keypair").clicked() {
+                        if let Err(e) = self.create() {
+                            self.last_error = e;
+                        } else {
+                            self.autosave_app_config();
+                        }
+                    }
+
+                    if ui.button("Clear").clicked() {
+                        self.keypair_base64.clear();
+                        self.public_key_base64.clear();
+                        self.autosave_app_config();
+                    }
+                });
+
+                if !self.keypair_base64.trim().is_empty() {
+                    let kp_copy = ui.button("Copy keypair");
+                    if kp_copy.clicked() {
+                        ui.output_mut(|o| o.copied_text = self.keypair_base64.clone());
+                    }
+                }
+
+                ui.add_space(4.0);
+                ui.label("Keypair (base64)");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.keypair_base64)
+                        .desired_rows(5)
+                        .desired_width(Self::INPUT_WIDTH),
+                );
+
+                if !self.public_key_base64.trim().is_empty() {
+                    let pk_copy = ui.button("Copy public key");
+                    if pk_copy.clicked() {
+                        ui.output_mut(|o| o.copied_text = self.public_key_base64.clone());
+                    }
+                }
+
+                ui.add_space(4.0);
+                ui.label("Public key (base64)");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.public_key_base64)
+                        .desired_rows(2)
+                        .desired_width(Self::INPUT_WIDTH)
+                        .interactive(false),
+                );
+            });
         });
     }
 
 }
 
 impl DavpApp {
+    #[allow(dead_code)]
     fn load_app_config(&mut self) {
         let path = AppConfig::path_in_repo_root();
         if let Ok(cfg) = AppConfig::load_or_create(&path) {
@@ -709,6 +938,7 @@ impl DavpApp {
         res
     }
 
+    #[allow(dead_code)]
     fn issuer_certification(
         &mut self,
         issuer_certificate_id: &str,
@@ -766,11 +996,22 @@ impl DavpApp {
             let _ = tx.send(true);
         }
 
-        if let Some(h) = self.sync_handle.take() {
-            h.abort();
+        if let Some(sync_handle) = self.sync_handle.take() {
+            let _ = self.rt.block_on(sync_handle);
         }
-        if let Some(h) = self.cnt_handle.take() {
-            h.abort();
+
+        if let Some(tx) = self.p2p_shutdown_tx.take() {
+            let _ = tx.send(true);
+        }
+
+        if let Some(p2p_handle) = self.p2p_handle.take() {
+            let _ = self.rt.block_on(p2p_handle);
+        }
+
+        self.p2p_outbound_tx = None;
+
+        if let Some(cnt_handle) = self.cnt_handle.take() {
+            let _ = self.rt.block_on(cnt_handle);
         }
 
         if let Some(node_handle) = self.node_handle.take() {
@@ -793,8 +1034,21 @@ impl DavpApp {
         if let Ok(mut g) = self.recent_peer_hits.lock() {
             g.clear();
         }
+        if let Ok(mut g) = self.dial_diagnostics.lock() {
+            g.clear();
+        }
         if let Ok(mut s) = self.cnt_ui_status.lock() {
             *s = CntUiStatus::default();
+        }
+
+        if let Ok(mut g) = self.upnp_status_line.lock() {
+            g.clear();
+        }
+        if let Ok(mut g) = self.upnp_external_ip.lock() {
+            *g = None;
+        }
+        if let Ok(mut g) = self.upnp_mapped_addr.lock() {
+            *g = None;
         }
     }
 
@@ -814,41 +1068,84 @@ impl DavpApp {
 
                     ui.separator();
 
-                    let connected = self
-                        .reachable_peers
-                        .lock()
-                        .map(|g| g.len())
-                        .unwrap_or_default();
+                    let connected = {
+                        self.rt
+                            .block_on(async move { connected_session_peers().await.len() })
+                    };
                     let known = {
                         let peers_arc = Arc::clone(&self.peers_arc);
                         self.rt.block_on(async move { peers_arc.read().await.len() })
                     };
-                    ui.label(format!("Peers: {} connected / {} known", connected, known));
+                    ui.label(format!("Peers: {}/{}", connected, known));
+                });
 
-                    if self.networking_started {
-                        ui.separator();
+                ui.add_space(4.0);
+            
 
-                        let uptime = self
-                            .networking_started_at
-                            .map(|t| Instant::now().duration_since(t).as_secs())
-                            .unwrap_or_default();
-                        ui.label(format!("Local uptime: {}s", uptime));
+                if self.networking_started {
+                    let uptime = self
+                        .networking_started_at
+                        .map(|t| Instant::now().duration_since(t).as_secs())
+                        .unwrap_or_default();
 
-                        let bind: Option<SocketAddr> = self.node_bind.parse().ok();
-                        let cnt_uptime_seconds: Option<i64> = bind.and_then(|b| {
-                            self.bootstrap_entries
-                                .lock()
-                                .ok()
-                                .and_then(|g| g.iter().find(|e| e.addr == b).map(|e| e.uptime_seconds))
-                        });
+                    let upnp_line = self
+                        .upnp_status_line
+                        .lock()
+                        .ok()
+                        .map(|g| g.clone())
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| "-".to_string());
 
-                        if let Some(cnt_uptime_seconds) = cnt_uptime_seconds {
-                            ui.label(format!("CNT uptime: {}s", cnt_uptime_seconds));
-                        } else {
-                            ui.label("CNT uptime: -");
+                    let observed_ip = self.observed_public_ip.lock().ok().and_then(|g| *g);
+
+                    let bind: Option<SocketAddr> = self.node_bind.parse().ok();
+                    let cnt_uptime_seconds: Option<i64> = bind.and_then(|b| {
+                        self.bootstrap_entries
+                            .lock()
+                            .ok()
+                            .and_then(|g| g.iter().find(|e| e.addr == b).map(|e| e.uptime_seconds))
+                    });
+
+                    egui::Grid::new("network_bar_kv").num_columns(2).show(ui, |ui| {
+                        ui.label("Uptime");
+                        ui.label(format!("{}s", uptime));
+                        ui.end_row();
+
+                        ui.label("Listen");
+                        ui.add(egui::Label::new(self.node_bind.trim()).wrap(true));
+                        ui.end_row();
+
+                        ui.label("UPnP");
+                        ui.add(egui::Label::new(upnp_line).wrap(true));
+                        ui.end_row();
+
+                        ui.label("Public IP");
+                        ui.label(
+                            observed_ip
+                                .map(|ip| ip.to_string())
+                                .unwrap_or_else(|| "-".to_string()),
+                        );
+                        ui.end_row();
+
+                        ui.label("CNT uptime");
+                        ui.label(
+                            cnt_uptime_seconds
+                                .map(|s| format!("{}s", s))
+                                .unwrap_or_else(|| "-".to_string()),
+                        );
+                        ui.end_row();
+                    });
+
+                    let upstream_ip = observed_ip.or_else(|| self.upnp_external_ip.lock().ok().and_then(|g| *g));
+                    if let Some(ip) = upstream_ip {
+                        if is_unroutable_ip(ip) {
+                            ui.colored_label(
+                                egui::Color32::YELLOW,
+                                "CGNAT/private upstream IP: inbound reachability unlikely (ok for client-only nodes).",
+                            );
                         }
                     }
-                });
+                }
 
                 {
                     let status = self
@@ -868,7 +1165,7 @@ impl DavpApp {
                         line.push_str("last_ok=never");
                     }
                     if let Some(e) = status.last_error {
-                        line.push_str(" error=");
+                        line.push_str(" last_error=");
                         line.push_str(&e);
                     }
                     ui.label(line);
@@ -883,16 +1180,60 @@ impl DavpApp {
                         ui.label("Max peers");
                         ui.add_enabled_ui(!self.networking_started, |ui| {
                             ui.horizontal(|ui| {
-                                ui.add(egui::DragValue::new(&mut self.max_peers).clamp_range(50..=usize::MAX));
+                                let mut v = self.max_peers;
+                                let resp = ui.add(
+                                    egui::DragValue::new(&mut v).clamp_range(50..=usize::MAX),
+                                );
+                                if ui.is_enabled() && resp.changed() {
+                                    self.max_peers = v;
+                                    self.autosave_app_config();
+                                }
                             });
                         });
                         ui.end_row();
 
-                        ui.label("Node bind");
+                        ui.label("UPnP");
                         ui.add_enabled_ui(!self.networking_started, |ui| {
-                            ui.text_edit_singleline(&mut self.node_bind);
+                            let before = self.upnp_enabled;
+                            ui.checkbox(&mut self.upnp_enabled, "Enabled");
+                            if before != self.upnp_enabled {
+                                self.autosave_app_config();
+                            }
                         });
                         ui.end_row();
+
+                        ui.label("Node IP (auto)");
+                        ui.add_enabled_ui(!self.networking_started, |ui| {
+                            let ip = self
+                                .observed_public_ip
+                                .lock()
+                                .ok()
+                                .and_then(|g| *g)
+                                .unwrap_or(self.detected_ip);
+                            ui.label(ip.to_string());
+                        });
+                        ui.end_row();
+
+                        ui.label("Node port");
+                        ui.add_enabled_ui(!self.networking_started, |ui| {
+                            let resp = ui.add(
+                                egui::TextEdit::singleline(&mut self.node_port_text)
+                                    .desired_width(80.0)
+                                    .char_limit(4),
+                            );
+                            if ui.is_enabled() && resp.changed() {
+                                if self.node_port_text.trim() == "*" {
+                                    self.node_port = 9001;
+                                    self.recompute_network_addrs();
+                                    self.autosave_app_config();
+                                } else {
+                                    self.normalize_node_port_text();
+                                    self.autosave_app_config();
+                                }
+                            }
+                        });
+                        ui.end_row();
+
 
                         ui.label("Seed peers");
                         ui.add_enabled_ui(!self.networking_started, |ui| {
@@ -950,9 +1291,22 @@ impl DavpApp {
                         });
                         ui.end_row();
                     });
-                });
 
                 ui.add_space(6.0);
+
+                egui::CollapsingHeader::new("Active sessions")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        let mut peers = self.rt.block_on(async move { connected_session_peers().await });
+                        peers.sort();
+                        if peers.is_empty() {
+                            ui.label("none");
+                        } else {
+                            for p in peers {
+                                ui.monospace(p.to_string());
+                            }
+                        }
+                    });
 
                 egui::CollapsingHeader::new("Connected peers in last second")
                     .default_open(false)
@@ -973,6 +1327,63 @@ impl DavpApp {
                         } else {
                             for p in peers {
                                 ui.monospace(p.to_string());
+                            }
+                        }
+                    });
+
+                egui::CollapsingHeader::new("Dial diagnostics")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        let snapshot: HashMap<SocketAddr, PeerDialStatus> = self
+                            .dial_diagnostics
+                            .lock()
+                            .map(|g| g.clone())
+                            .unwrap_or_default();
+
+                        if snapshot.is_empty() {
+                            ui.label("none");
+                            return;
+                        }
+
+                        let mut items: Vec<(SocketAddr, PeerDialStatus)> = snapshot.into_iter().collect();
+                        items.sort_by_key(|(_, s)| s.last_attempt);
+                        items.reverse();
+
+                        let now = Instant::now();
+                        for (peer, s) in items.into_iter().take(50) {
+                            let age_ms = s
+                                .last_attempt
+                                .map(|t| now.duration_since(t).as_millis())
+                                .unwrap_or_default();
+                            let dur_ms = s.last_duration_ms.unwrap_or_default();
+                            let stage = s
+                                .last_stage
+                                .as_deref()
+                                .unwrap_or("-");
+                            if let Some(err) = &s.last_error {
+                                ui.monospace(format!(
+                                    "{} | stage={} | unreachable (normal) | fail={} (consecutive={}) score={} | last={}ms_ago | dur={}ms | {}",
+                                    peer,
+                                    stage,
+                                    s.err_count,
+                                    s.consecutive_failures,
+                                    s.failure_score,
+                                    age_ms,
+                                    dur_ms,
+                                    err
+                                ));
+                            } else if s.last_ok.is_some() {
+                                ui.monospace(format!(
+                                    "{} | stage={} | ok={} score={} | last={}ms_ago | dur={}ms",
+                                    peer,
+                                    stage,
+                                    s.ok_count,
+                                    s.failure_score,
+                                    age_ms,
+                                    dur_ms
+                                ));
+                            } else {
+                                ui.monospace(format!("{} | no attempts", peer));
                             }
                         }
                     });
@@ -1041,6 +1452,7 @@ impl DavpApp {
                                 });
                         }
                     });
+            });
         });
     }
 
@@ -1053,39 +1465,182 @@ impl DavpApp {
             return;
         }
 
+        // Public address is discovered via peers (observed address in Ping/Pong).
+
         let bind: SocketAddr = match self.node_bind.parse() {
             Ok(v) => v,
             Err(_) => return,
         };
+
+        let local_ip = self.detected_ip;
+        let upnp_enabled = self.upnp_enabled;
+        let upnp_status_line = Arc::clone(&self.upnp_status_line);
+        let upnp_external_ip = Arc::clone(&self.upnp_external_ip);
+        let upnp_mapped_addr = Arc::clone(&self.upnp_mapped_addr);
 
         let peers_arc = Arc::clone(&self.peers_arc);
         let peer_graph = Arc::clone(&self.peer_graph);
         let bootstrap_entries = Arc::clone(&self.bootstrap_entries);
         let reachable_peers = Arc::clone(&self.reachable_peers);
         let recent_peer_hits = Arc::clone(&self.recent_peer_hits);
+        let dial_diagnostics = Arc::clone(&self.dial_diagnostics);
         let cnt_ui_status = Arc::clone(&self.cnt_ui_status);
+        let observed_public_ip = Arc::clone(&self.observed_public_ip);
 
         let cnt_server: SocketAddr = match resolve_socket_addr(self.cnt_server.trim()) {
             Some(v) => v,
             None => return,
         };
         let max_peers = self.max_peers;
-
         let (sync_shutdown_tx, sync_shutdown_rx) = watch::channel(false);
         self.sync_shutdown_tx = Some(sync_shutdown_tx);
 
         let (node_shutdown_tx, node_shutdown_rx) = watch::channel(false);
         self.node_shutdown_tx = Some(node_shutdown_tx);
 
+        let (p2p_shutdown_tx, p2p_shutdown_rx) = watch::channel(false);
+        self.p2p_shutdown_tx = Some(p2p_shutdown_tx);
+
         let (cnt_enabled_tx, cnt_enabled_rx) = watch::channel(self.cnt_enabled);
         self.cnt_enabled_tx = Some(cnt_enabled_tx);
 
         let storage = Storage::new(self.storage_dir.clone());
+        let advertise_addr_value: SocketAddr = self.advertise_addr.parse().unwrap_or(bind);
+        let advertise_addr: Arc<Mutex<SocketAddr>> = Arc::new(Mutex::new(advertise_addr_value));
         let config = NodeConfig {
             bind_addr: bind,
+            advertise_addr: Arc::clone(&advertise_addr),
             peers: Arc::clone(&peers_arc),
             peer_graph: Arc::clone(&peer_graph),
+            last_inbound: Arc::clone(&self.last_inbound),
         };
+
+        if upnp_enabled {
+            let advertise_addr = Arc::clone(&advertise_addr);
+            self.rt.spawn(async move {
+                if let Ok(mut g) = upnp_status_line.lock() {
+                    *g = "UPnP: searching gateway...".to_string();
+                }
+
+                let opts = SearchOptions {
+                    timeout: Some(Duration::from_secs(3)),
+                    ..Default::default()
+                };
+                let gw = match igd_tokio::search_gateway(opts).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if let Ok(mut g) = upnp_status_line.lock() {
+                            *g = format!("UPnP: unavailable ({})", e);
+                        }
+                        return;
+                    }
+                };
+
+                let ext_ip: Option<IpAddr> = match gw.get_external_ip().await {
+                    Ok(v) => {
+                        if let Ok(mut g) = upnp_external_ip.lock() {
+                            *g = Some(v);
+                        }
+                        Some(v)
+                    }
+                    Err(e) => {
+                        if let Ok(mut g) = upnp_status_line.lock() {
+                            *g = format!(
+                                "UPnP: gateway found, external IP unavailable ({})",
+                                e
+                            );
+                        }
+                        None
+                    }
+                };
+
+                let local_addr = SocketAddr::new(local_ip, bind.port());
+                let port = bind.port();
+
+                let mut mapped: Option<SocketAddr> = None;
+                let mut mapped_port: Option<u16> = None;
+                if gw
+                    .add_port(
+                        PortMappingProtocol::TCP,
+                        port,
+                        local_addr,
+                        3600,
+                        "DAVP",
+                    )
+                    .await
+                    .is_ok()
+                {
+                    mapped_port = Some(port);
+                    if let Some(ext_ip) = ext_ip {
+                        mapped = Some(SocketAddr::new(ext_ip, port));
+                    }
+                } else if let Ok(p) = gw
+                    .add_any_port(PortMappingProtocol::TCP, local_addr, 3600, "DAVP")
+                    .await
+                {
+                    mapped_port = Some(p);
+                    if let Some(ext_ip) = ext_ip {
+                        mapped = Some(SocketAddr::new(ext_ip, p));
+                    }
+                }
+
+                if let Some(mapped) = mapped {
+                    if let Ok(mut g) = upnp_mapped_addr.lock() {
+                        *g = Some(mapped);
+                    }
+                    if !is_unroutable_ip(mapped.ip()) {
+                        if let Ok(mut g) = advertise_addr.lock() {
+                            *g = mapped;
+                        }
+                    }
+                    if let Ok(mut g) = upnp_status_line.lock() {
+                        *g = format!("UPnP: mapped {} -> {}", mapped, local_addr);
+                    }
+                    return;
+                }
+
+                if let Some(p) = mapped_port {
+                    if let Ok(mut g) = upnp_status_line.lock() {
+                        *g = format!(
+                            "UPnP: mapped external port {} -> {} (external IP unknown)",
+                            p, local_addr
+                        );
+                    }
+                    return;
+                }
+
+                if let Ok(mut g) = upnp_status_line.lock() {
+                    *g = match ext_ip {
+                        Some(ip) => format!("UPnP: gateway external IP {} (no mapping)", ip),
+                        None => "UPnP: gateway found (no mapping)".to_string(),
+                    };
+                }
+            });
+        }
+
+        // Start libp2p overlay network (gossipsub hub). This enables proof propagation even
+        // when direct TCP dialing fails due to NAT.
+        let (p2p_outbound_tx, p2p_outbound_rx) = mpsc::unbounded_channel::<OutboundMsg>();
+        self.p2p_outbound_tx = Some(p2p_outbound_tx);
+        let p2p_storage = storage.clone();
+        let mut bootstrap = Vec::new();
+        // Default hub. You can override with DAVP_P2P_HUB, e.g.
+        // /ip4/cnt.unitedorigins.com/tcp/4002
+        if let Ok(s) = std::env::var("DAVP_P2P_HUB") {
+            if let Ok(ma) = s.parse::<libp2p::Multiaddr>() {
+                bootstrap.push(ma);
+            }
+        }
+        if bootstrap.is_empty() {
+            if let Ok(ma) = "/ip4/cnt.unitedorigins.com/tcp/4002".parse::<libp2p::Multiaddr>() {
+                bootstrap.push(ma);
+            }
+        }
+        let listen_ma = "/ip4/0.0.0.0/tcp/0".parse::<libp2p::Multiaddr>().unwrap();
+        let p2p_handle = self.rt.spawn(async move {
+            let _ = run_p2p(p2p_storage, listen_ma, bootstrap, p2p_shutdown_rx, p2p_outbound_rx).await;
+        });
+        self.p2p_handle = Some(p2p_handle);
 
         let node_handle = self.rt.spawn(async move {
             let _ = run_node_with_shutdown(storage, config, node_shutdown_rx).await;
@@ -1101,9 +1656,13 @@ impl DavpApp {
         let bootstrap_entries_ping = Arc::clone(&bootstrap_entries);
         let reachable_peers_ping = Arc::clone(&reachable_peers);
         let recent_peer_hits_ping = Arc::clone(&recent_peer_hits);
+        let dial_diagnostics_ping = Arc::clone(&dial_diagnostics);
         let cnt_ui_status_ping = Arc::clone(&cnt_ui_status);
+        let observed_public_ip_ping = Arc::clone(&observed_public_ip);
+        let advertise_addr_ping = Arc::clone(&advertise_addr);
 
         let (cnt_force_tx, mut cnt_force_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+let dial_cursor = Arc::new(AtomicUsize::new(0));
         let sync_handle = self.rt.spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_millis(100));
 
@@ -1120,6 +1679,7 @@ impl DavpApp {
                         let cnt_enabled = *cnt_enabled_rx_ping.borrow();
                         let ctx = SyncNetworkCtx {
                             bind,
+                            advertise_addr: Arc::clone(&advertise_addr_ping),
                             max_peers,
                             peers_arc: Arc::clone(&peers_arc_ping),
                             peer_graph: Arc::clone(&peer_graph_ping),
@@ -1127,10 +1687,13 @@ impl DavpApp {
                             bootstrap_entries: Arc::clone(&bootstrap_entries_ping),
                             reachable_peers: Arc::clone(&reachable_peers_ping),
                             recent_peer_hits: Arc::clone(&recent_peer_hits_ping),
+                            dial_diagnostics: Arc::clone(&dial_diagnostics_ping),
                             cnt_ui_status: Arc::clone(&cnt_ui_status_ping),
+                            observed_public_ip: Arc::clone(&observed_public_ip_ping),
                             cnt_enabled,
                             cnt_report_only: false,
                             cnt_force_tx: cnt_force_tx.clone(),
+                            dial_cursor: Arc::clone(&dial_cursor),
                         };
                         let _ = sync_network_once(ctx).await;
                     }
@@ -1147,6 +1710,8 @@ impl DavpApp {
         let peer_graph_cnt = Arc::clone(&peer_graph);
         let bootstrap_entries_cnt = Arc::clone(&bootstrap_entries);
         let cnt_ui_status_cnt = Arc::clone(&cnt_ui_status);
+        let observed_public_ip_cnt = Arc::clone(&observed_public_ip);
+        let advertise_addr_cnt = Arc::clone(&advertise_addr);
         let cnt_handle = self.rt.spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(1));
             let mut upload_gossip = false;
@@ -1172,11 +1737,13 @@ impl DavpApp {
                             let cnt_enabled = *cnt_enabled_rx_cnt.borrow();
                             let ctx = CntReportCtx {
                                 bind,
+                                advertise_addr: Arc::clone(&advertise_addr_cnt),
                                 peers_arc: Arc::clone(&peers_arc_cnt),
                                 peer_graph: Arc::clone(&peer_graph_cnt),
                                 cnt_server,
                                 bootstrap_entries: Arc::clone(&bootstrap_entries_cnt),
                                 cnt_ui_status: Arc::clone(&cnt_ui_status_cnt),
+                                observed_public_ip: Arc::clone(&observed_public_ip_cnt),
                                 cnt_enabled,
                                 upload_gossip: true,
                             };
@@ -1187,11 +1754,13 @@ impl DavpApp {
                         let cnt_enabled = *cnt_enabled_rx_cnt.borrow();
                         let ctx = CntReportCtx {
                             bind,
+                            advertise_addr: Arc::clone(&advertise_addr_cnt),
                             peers_arc: Arc::clone(&peers_arc_cnt),
                             peer_graph: Arc::clone(&peer_graph_cnt),
                             cnt_server,
                             bootstrap_entries: Arc::clone(&bootstrap_entries_cnt),
                             cnt_ui_status: Arc::clone(&cnt_ui_status_cnt),
+                            observed_public_ip: Arc::clone(&observed_public_ip_cnt),
                             cnt_enabled,
                             upload_gossip,
                         };
@@ -1568,19 +2137,21 @@ impl DavpApp {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         let mut do_create = false;
-                        if ui.button("Create proof").clicked() {
+                        if ui
+                            .add_enabled(!self.create_in_progress, egui::Button::new("Create proof"))
+                            .clicked()
+                        {
                             do_create = true;
                         }
                         if ui.button("Cancel").clicked() {
                             close_modal = true;
                         }
                         if do_create {
-                            match self.create_proof() {
-                                Ok(()) => {
-                                    close_modal = true;
-                                }
-                                Err(e) => self.last_error = e,
-                            }
+                            self.start_create_proof();
+                        }
+                        if self.create_in_progress {
+                            ui.add_space(8.0);
+                            ui.monospace("working...");
                         }
                     });
                 });
@@ -1632,19 +2203,21 @@ impl DavpApp {
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         let mut do_verify = false;
-                        if ui.button("Verify").clicked() {
+                        if ui
+                            .add_enabled(!self.verify_in_progress, egui::Button::new("Verify"))
+                            .clicked()
+                        {
                             do_verify = true;
                         }
                         if ui.button("Close").clicked() {
                             close_verify_modal = true;
                         }
                         if do_verify {
-                            match self.verify() {
-                                Ok(()) => {
-                                    close_verify_modal = true;
-                                }
-                                Err(e) => self.last_error = e,
-                            }
+                            self.start_verify();
+                        }
+                        if self.verify_in_progress {
+                            ui.add_space(8.0);
+                            ui.monospace("working...");
                         }
                     });
                 });
@@ -1653,9 +2226,10 @@ impl DavpApp {
             verify_open = false;
         }
         self.verify_modal_open = verify_open;
+
     }
 
-    fn keygen(&mut self) -> std::result::Result<(), String> {
+    fn create(&mut self) -> std::result::Result<(), String> {
         let keypair = KeypairBytes::generate();
         let pubkey = keypair.public_key_bytes().map_err(|e| e.to_string())?;
 
@@ -1664,328 +2238,409 @@ impl DavpApp {
         Ok(())
     }
 
-    fn create_proof(&mut self) -> std::result::Result<(), String> {
-        let file_path = PathBuf::from(self.create_file_path.trim());
-        let bytes = std::fs::read(file_path).map_err(|e| e.to_string())?;
-
-        let kp = KeypairBytes::from_base64(self.keypair_base64.trim()).map_err(|e| e.to_string())?;
-        let asset_type = parse_asset_type(&self.create_asset_type)?;
-
-        let tags = parse_tags(&self.create_tags);
-        let description = if self.create_description.trim().is_empty() {
-            None
-        } else {
-            Some(self.create_description.trim().to_string())
-        };
-        let parent_verification_id = if self.create_parent_verification_id.trim().is_empty() {
-            None
-        } else {
-            Some(self.create_parent_verification_id.trim().to_string())
-        };
-
-        let issuer_certificate_id = if self.create_issuer_certificate_id.trim().is_empty() {
-            None
-        } else {
-            Some(self.create_issuer_certificate_id.trim().to_string())
-        };
-
-        let metadata = Metadata::new(tags, description, parent_verification_id);
-        let proof = create_proof_from_bytes(
-            &bytes,
-            asset_type,
-            self.create_ai_assisted,
-            metadata,
-            &kp,
-        )
-        .map_err(|e| e.to_string())?;
-
-        let storage = Storage::new(self.storage_dir.clone());
-        let published = PublishedProof {
-            proof: proof.clone(),
-            issuer_certificate_id: issuer_certificate_id.clone(),
-        };
-        storage.store_published_proof(&published).map_err(|e| e.to_string())?;
-
-        let peers_arc = Arc::clone(&self.peers_arc);
-        let peers = self
-            .rt
-            .block_on(async move { peers_arc.read().await.clone() });
-        if !peers.is_empty() {
-            self.rt
-                .block_on(async {
-                    if published.issuer_certificate_id.is_some() {
-                        replicate_published_proof(&published, &peers).await;
-                    } else {
-                        replicate_proof(&proof, &peers).await;
-                    }
-                });
+    fn start_create_proof(&mut self) {
+        if self.create_in_progress {
+            return;
         }
+        self.create_in_progress = true;
 
-        self.created_verification_id = proof.verification_id;
-        self.created_creator_public_key_base64 =
-            base64::engine::general_purpose::STANDARD.encode(proof.creator_public_key);
-        self.created_signature_base64 =
-            base64::engine::general_purpose::STANDARD.encode(proof.signature.0);
-        self.created_issuer_certificate_id_display = issuer_certificate_id.unwrap_or_default();
-        Ok(())
-    }
+        let create_file_path = self.create_file_path.trim().to_string();
+        let keypair_base64 = self.keypair_base64.trim().to_string();
+        let create_asset_type = self.create_asset_type.clone();
+        let create_ai_assisted = self.create_ai_assisted;
+        let create_tags = self.create_tags.clone();
+        let create_description = self.create_description.clone();
+        let create_parent_verification_id = self.create_parent_verification_id.clone();
+        let create_issuer_certificate_id = self.create_issuer_certificate_id.clone();
+        let storage_dir = self.storage_dir.clone();
 
-    fn verify(&mut self) -> std::result::Result<(), String> {
-        let vid = self.verify_verification_id.trim().to_string();
-        let storage = Storage::new(self.storage_dir.clone());
         let peers_arc = Arc::clone(&self.peers_arc);
-        let peers = self
-            .rt
-            .block_on(async move { peers_arc.read().await.clone() });
+        let bootstrap_entries = Arc::clone(&self.bootstrap_entries);
+        let bind: SocketAddr = self
+            .node_bind
+            .trim()
+            .parse()
+            .unwrap_or(SocketAddr::from(([127, 0, 0, 1], 0)));
+        let gui_task_tx = self.gui_task_tx.clone();
+        let p2p_tx = self.p2p_outbound_tx.clone();
 
-        let content = if self.verify_file_path.trim().is_empty() {
-            None
-        } else {
-            Some(std::fs::read(self.verify_file_path.trim()).map_err(|e| e.to_string())?)
-        };
+        self.rt.spawn(async move {
+            let blocking_res = tokio::task::spawn_blocking(move || -> std::result::Result<(Proof, PublishedProof, String), String> {
+                let file_path = PathBuf::from(create_file_path.trim());
+                let bytes = std::fs::read(file_path).map_err(|e| e.to_string())?;
 
-        if vid.is_empty() {
-            self.verify_view = None;
-            let bytes = content.ok_or_else(|| "file is required when verification_id is empty".to_string())?;
-            let asset_hash = blake3_hash_bytes(&bytes);
+                let kp = KeypairBytes::from_base64(keypair_base64.trim()).map_err(|e| e.to_string())?;
+                let asset_type = parse_asset_type(&create_asset_type)?;
 
-            let mut ids = storage
-                .lookup_by_hash(&asset_hash)
-                .map_err(|e| e.to_string())?;
-
-            if ids.is_empty() && !peers.is_empty() {
-                ids = self
-                    .rt
-                    .block_on(fetch_ids_by_hash_from_peers(&peers, &asset_hash))
-                    .map_err(|e| e.to_string())?;
-            }
-
-            for id in ids {
-                let published = if storage.contains(&id) {
-                    storage.retrieve_published_proof(&id).map_err(|e| e.to_string())?
-                } else if !peers.is_empty() {
-                    let maybe_published = self
-                        .rt
-                        .block_on(fetch_published_proof_from_peers(&peers, &id))
-                        .map_err(|e| e.to_string())?;
-                    if let Some(published) = maybe_published {
-                        if let Err(e) = storage.store_published_proof(&published) {
-                            if self.last_error.trim().is_empty() {
-                                self.last_error = format!("storage: {}", e);
-                            }
-                        }
-                        published
-                    } else {
-                        let maybe = self
-                            .rt
-                            .block_on(fetch_proof_from_peers(&peers, &id))
-                            .map_err(|e| e.to_string())?;
-                        let Some(p) = maybe else { continue };
-                        if let Err(e) = storage.store_proof(&p) {
-                            if self.last_error.trim().is_empty() {
-                                self.last_error = format!("storage: {}", e);
-                            }
-                        }
-                        PublishedProof {
-                            proof: p,
-                            issuer_certificate_id: None,
-                        }
-                    }
+                let tags = parse_tags(&create_tags);
+                let description = if create_description.trim().is_empty() {
+                    None
                 } else {
-                    continue;
+                    Some(create_description.trim().to_string())
+                };
+                let parent_verification_id = if create_parent_verification_id.trim().is_empty() {
+                    None
+                } else {
+                    Some(create_parent_verification_id.trim().to_string())
+                };
+                let issuer_certificate_id = if create_issuer_certificate_id.trim().is_empty() {
+                    None
+                } else {
+                    Some(create_issuer_certificate_id.trim().to_string())
                 };
 
-                if verify_proof(&published.proof, Some(&bytes)).is_ok() {
-                    let mut status = String::new();
-                    status.push_str("valid\n");
-                    status.push_str(&format!("verification_id={}\n", published.proof.verification_id));
-                    status.push_str(&format!("timestamp={}\n", published.proof.timestamp.to_rfc3339()));
-                    status.push_str(&format!(
-                        "creator_public_key_base64={}\n",
-                        base64::engine::general_purpose::STANDARD.encode(published.proof.creator_public_key)
-                    ));
-                    status.push_str(&format!(
-                        "signature_base64={}\n",
-                        base64::engine::general_purpose::STANDARD.encode(published.proof.signature.0)
-                    ));
-                    if let Some(id) = published.issuer_certificate_id.as_deref() {
-                        status.push_str(&format!("issuer_certificate_id={}\n", id));
+                let metadata = Metadata::new(tags, description, parent_verification_id);
+                let proof = create_proof_from_bytes(
+                    &bytes,
+                    asset_type,
+                    create_ai_assisted,
+                    metadata,
+                    &kp,
+                )
+                .map_err(|e| e.to_string())?;
 
-                        let (cert_detailed, fetch_err_reason) =
-                            self.issuer_certification(id, &published.proof.creator_public_key);
+                let storage = Storage::new(storage_dir);
+                let published = PublishedProof {
+                    proof: proof.clone(),
+                    issuer_certificate_id: issuer_certificate_id.clone(),
+                };
+                storage.store_published_proof(&published).map_err(|e| e.to_string())?;
 
-                        match cert_detailed {
-                            IssuerCertificationDetailed::Certified { organization_name } => {
-                                status.push_str("certified issuer\n");
-                                status.push_str(&format!("organization_name={}\n", organization_name));
-                                self.verify_view = Some(VerifyResultView {
-                                    verification_id: published.proof.verification_id.clone(),
-                                    timestamp_rfc3339: published.proof.timestamp.to_rfc3339(),
-                                    creator_public_key_base64: base64::engine::general_purpose::STANDARD
-                                        .encode(published.proof.creator_public_key),
-                                    signature_base64: base64::engine::general_purpose::STANDARD
-                                        .encode(published.proof.signature.0),
-                                    issuer_certificate_id: Some(id.to_string()),
-                                    issuer_certified: true,
-                                    organization_name: Some(organization_name),
-                                    issuer_unverified_reason: None,
-                                });
-                            }
-                            _ => {
-                                status.push_str("unverified issuer\n");
-                                self.verify_view = Some(VerifyResultView {
-                                    verification_id: published.proof.verification_id.clone(),
-                                    timestamp_rfc3339: published.proof.timestamp.to_rfc3339(),
-                                    creator_public_key_base64: base64::engine::general_purpose::STANDARD
-                                        .encode(published.proof.creator_public_key),
-                                    signature_base64: base64::engine::general_purpose::STANDARD
-                                        .encode(published.proof.signature.0),
-                                    issuer_certificate_id: Some(id.to_string()),
-                                    issuer_certified: false,
-                                    organization_name: None,
-                                    issuer_unverified_reason: fetch_err_reason
-                                        .or_else(|| issuer_unverified_reason(&cert_detailed)),
-                                });
-                            }
+                Ok((proof, published, issuer_certificate_id.unwrap_or_default()))
+            })
+            .await;
+
+            let (proof, published, issuer_certificate_id_display) = match blocking_res {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
+                    let _ = gui_task_tx.send(GuiTaskMsg::TaskError { message: e });
+                    return;
+                }
+                Err(e) => {
+                    let _ = gui_task_tx.send(GuiTaskMsg::TaskError { message: format!("{}", e) });
+                    return;
+                }
+            };
+
+            let mut peers = connected_session_peers().await;
+            if peers.is_empty() {
+                peers = peers_arc.read().await.clone();
+                if let Ok(g) = bootstrap_entries.lock() {
+                    for e in g.iter() {
+                        peers.push(e.addr);
+                    }
+                }
+            }
+            peers.retain(|p| *p != bind);
+            peers.sort();
+            peers.dedup();
+            peers.truncate(8);
+
+            if !peers.is_empty() {
+                if published.issuer_certificate_id.is_some() {
+                    replicate_published_proof(&published, &peers).await;
+                } else {
+                    replicate_proof(&proof, &peers).await;
+                }
+            }
+            if let Some(tx) = p2p_tx {
+                let _ = tx.send(OutboundMsg::PublishedProof(published.clone()));
+            }
+
+            let _ = gui_task_tx.send(GuiTaskMsg::CreateDone {
+                verification_id: proof.verification_id,
+                creator_public_key_base64: base64::engine::general_purpose::STANDARD
+                    .encode(proof.creator_public_key),
+                signature_base64: base64::engine::general_purpose::STANDARD.encode(proof.signature.0),
+                issuer_certificate_id_display,
+            });
+        });
+    }
+
+    fn start_verify(&mut self) {
+        if self.verify_in_progress {
+            return;
+        }
+        self.verify_in_progress = true;
+
+        let vid = self.verify_verification_id.trim().to_string();
+        let verify_file_path = self.verify_file_path.trim().to_string();
+        let storage_dir = self.storage_dir.clone();
+        let certs_url = self.certs_url.clone();
+
+        let peers_arc = Arc::clone(&self.peers_arc);
+        let bootstrap_entries = Arc::clone(&self.bootstrap_entries);
+        let bind: SocketAddr = self
+            .node_bind
+            .trim()
+            .parse()
+            .unwrap_or(SocketAddr::from(([127, 0, 0, 1], 0)));
+        let gui_task_tx = self.gui_task_tx.clone();
+
+        self.rt.spawn(async move {
+            let mut peers = connected_session_peers().await;
+            if peers.is_empty() {
+                peers = peers_arc.read().await.clone();
+                if let Ok(g) = bootstrap_entries.lock() {
+                    for e in g.iter() {
+                        peers.push(e.addr);
+                    }
+                }
+            }
+            peers.retain(|p| *p != bind);
+            peers.sort();
+            peers.dedup();
+            peers.truncate(8);
+
+            let content = if verify_file_path.trim().is_empty() {
+                None
+            } else {
+                match tokio::task::spawn_blocking(move || std::fs::read(verify_file_path)).await {
+                    Ok(Ok(v)) => Some(v),
+                    Ok(Err(e)) => {
+                        let _ = gui_task_tx.send(GuiTaskMsg::TaskError { message: format!("{}", e) });
+                        return;
+                    }
+                    Err(e) => {
+                        let _ = gui_task_tx.send(GuiTaskMsg::TaskError { message: format!("{}", e) });
+                        return;
+                    }
+                }
+            };
+
+            let vid_for_blocking = vid.clone();
+            let storage_dir_for_blocking = storage_dir.clone();
+            let content_for_blocking = content.clone();
+            let res = tokio::task::spawn_blocking(move || -> std::result::Result<(String, Option<VerifyResultView>), String> {
+                let storage = Storage::new(storage_dir_for_blocking);
+
+                if vid_for_blocking.is_empty() {
+                    let bytes = content_for_blocking.ok_or_else(|| "file is required when verification_id is empty".to_string())?;
+                    let asset_hash = blake3_hash_bytes(&bytes);
+
+                    let ids = storage.lookup_by_hash(&asset_hash).map_err(|e| e.to_string())?;
+                    return Ok((
+                        if ids.is_empty() { "not found".to_string() } else { ids.join("\n") },
+                        None,
+                    ));
+                }
+
+                let published = if storage.contains(&vid_for_blocking) {
+                    storage
+                        .retrieve_published_proof(&vid_for_blocking)
+                        .map_err(|e| e.to_string())?
+                } else {
+                    return Ok(("not found".to_string(), None));
+                };
+
+                verify_proof(&published.proof, content_for_blocking.as_deref()).map_err(|e| e.to_string())?;
+
+                let mut status = String::new();
+                status.push_str("valid\n");
+                status.push_str(&format!("verification_id={}\n", published.proof.verification_id));
+                status.push_str(&format!("timestamp={}\n", published.proof.timestamp.to_rfc3339()));
+                status.push_str(&format!(
+                    "creator_public_key_base64={}\n",
+                    base64::engine::general_purpose::STANDARD.encode(published.proof.creator_public_key)
+                ));
+                status.push_str(&format!(
+                    "signature_base64={}\n",
+                    base64::engine::general_purpose::STANDARD.encode(published.proof.signature.0)
+                ));
+
+                let view = Some(VerifyResultView {
+                    verification_id: published.proof.verification_id.clone(),
+                    timestamp_rfc3339: published.proof.timestamp.to_rfc3339(),
+                    creator_public_key_base64: base64::engine::general_purpose::STANDARD
+                        .encode(published.proof.creator_public_key),
+                    signature_base64: base64::engine::general_purpose::STANDARD
+                        .encode(published.proof.signature.0),
+                    issuer_certificate_id: published.issuer_certificate_id.clone(),
+                    issuer_certified: false,
+                    organization_name: None,
+                    issuer_unverified_reason: None,
+                });
+
+                Ok((status, view))
+            })
+            .await;
+
+            let (mut status, mut view) = match res {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
+                    let _ = gui_task_tx.send(GuiTaskMsg::TaskError { message: e });
+                    return;
+                }
+                Err(e) => {
+                    let _ = gui_task_tx.send(GuiTaskMsg::TaskError { message: format!("{}", e) });
+                    return;
+                }
+            };
+
+            if status.trim() == "not found" && !peers.is_empty() && !vid.is_empty() {
+                let maybe_published = match fetch_published_proof_from_peers(&peers, &vid).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = gui_task_tx.send(GuiTaskMsg::TaskError { message: format!("{}", e) });
+                        return;
+                    }
+                };
+
+                if let Some(published) = maybe_published {
+                    let _ = tokio::task::spawn_blocking({
+                        let storage_dir2 = storage_dir.clone();
+                        let published2 = published.clone();
+                        move || {
+                            let storage = Storage::new(storage_dir2);
+                            let _ = storage.store_published_proof(&published2);
                         }
-                    } else {
-                        status.push_str("unverified issuer\n");
-                        self.verify_view = Some(VerifyResultView {
-                            verification_id: published.proof.verification_id.clone(),
-                            timestamp_rfc3339: published.proof.timestamp.to_rfc3339(),
+                    })
+                    .await;
+
+                    status = "valid\n".to_string();
+                    view = Some(VerifyResultView {
+                        verification_id: published.proof.verification_id.clone(),
+                        timestamp_rfc3339: published.proof.timestamp.to_rfc3339(),
+                        creator_public_key_base64: base64::engine::general_purpose::STANDARD
+                            .encode(published.proof.creator_public_key),
+                        signature_base64: base64::engine::general_purpose::STANDARD
+                            .encode(published.proof.signature.0),
+                        issuer_certificate_id: published.issuer_certificate_id.clone(),
+                        issuer_certified: false,
+                        organization_name: None,
+                        issuer_unverified_reason: None,
+                    });
+                } else {
+                    let maybe = match fetch_proof_from_peers(&peers, &vid).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = gui_task_tx.send(GuiTaskMsg::TaskError { message: format!("{}", e) });
+                            return;
+                        }
+                    };
+                    if let Some(p) = maybe {
+                        let _ = tokio::task::spawn_blocking({
+                            let storage_dir2 = storage_dir.clone();
+                            let p2 = p.clone();
+                            move || {
+                                let storage = Storage::new(storage_dir2);
+                                let _ = storage.store_proof(&p2);
+                            }
+                        })
+                        .await;
+                        status = "valid\n".to_string();
+                        view = Some(VerifyResultView {
+                            verification_id: p.verification_id.clone(),
+                            timestamp_rfc3339: p.timestamp.to_rfc3339(),
                             creator_public_key_base64: base64::engine::general_purpose::STANDARD
-                                .encode(published.proof.creator_public_key),
-                            signature_base64: base64::engine::general_purpose::STANDARD
-                                .encode(published.proof.signature.0),
+                                .encode(p.creator_public_key),
+                            signature_base64: base64::engine::general_purpose::STANDARD.encode(p.signature.0),
                             issuer_certificate_id: None,
                             issuer_certified: false,
                             organization_name: None,
                             issuer_unverified_reason: None,
                         });
                     }
-                    self.verify_status = status;
-                    return Ok(());
                 }
             }
 
-            self.verify_status = "not found".to_string();
-            self.verify_view = None;
-            return Ok(());
-        }
+            if let Some(v) = view.as_mut() {
+                if let Some(id) = v.issuer_certificate_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    let url = if certs_url.trim().is_empty() {
+                        DEFAULT_CERTS_URL.to_string()
+                    } else {
+                        certs_url.trim().to_string()
+                    };
 
-        let published = if storage.contains(&vid) {
-            storage.retrieve_published_proof(&vid).map_err(|e| e.to_string())?
-        } else if !peers.is_empty() {
-            let maybe_published = self
-                .rt
-                .block_on(fetch_published_proof_from_peers(&peers, &vid))
-                .map_err(|e| e.to_string())?;
-            if let Some(published) = maybe_published {
-                if let Err(e) = storage.store_published_proof(&published) {
-                    if self.last_error.trim().is_empty() {
-                        self.last_error = format!("storage: {}", e);
+                    let creator_pk_bytes = match base64::engine::general_purpose::STANDARD
+                        .decode(v.creator_public_key_base64.trim())
+                        .ok()
+                        .and_then(|b| b.as_slice().try_into().ok())
+                    {
+                        Some(v) => v,
+                        None => {
+                            v.issuer_certified = false;
+                            v.organization_name = None;
+                            v.issuer_unverified_reason = Some(
+                                "invalid creator_public_key_base64 (expected 32-byte ed25519 key)".to_string(),
+                            );
+                            let _ = gui_task_tx.send(GuiTaskMsg::VerifyDone { status, view });
+                            return;
+                        }
+                    };
+
+                    match fetch_certificate_bundle(&url).await {
+                        Ok(bundle) => {
+                            let ca_b64 = bundle
+                                .certificates
+                                .iter()
+                                .find(|c| c.certificate_id.trim() == id)
+                                .and_then(|c| c.ca_public_key_base64.as_deref())
+                                .or(bundle.ca_public_key_base64.as_deref())
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(|s| s.to_string())
+                                .or_else(|| std::env::var("DAVP_CA_PUBLIC_KEY_BASE64").ok());
+
+                            let Some(ca_b64) = ca_b64 else {
+                                v.issuer_certified = false;
+                                v.organization_name = None;
+                                v.issuer_unverified_reason = Some("missing ca_public_key_base64".to_string());
+                                let _ = gui_task_tx.send(GuiTaskMsg::VerifyDone { status, view });
+                                return;
+                            };
+
+                            let ca_pk_bytes = base64::engine::general_purpose::STANDARD
+                                .decode(ca_b64.trim())
+                                .ok();
+                            let ca_pk: Option<[u8; 32]> = ca_pk_bytes.and_then(|b| b.try_into().ok());
+                            let Some(ca_pk) = ca_pk else {
+                                v.issuer_certified = false;
+                                v.organization_name = None;
+                                v.issuer_unverified_reason = Some("invalid ca_public_key_base64".to_string());
+                                let _ = gui_task_tx.send(GuiTaskMsg::VerifyDone { status, view });
+                                return;
+                            };
+
+                            let detailed = verify_issuer_certificate_detailed(
+                                &bundle.certificates,
+                                id,
+                                &creator_pk_bytes,
+                                &ca_pk,
+                                chrono::Utc::now(),
+                            )
+                            .unwrap_or(IssuerCertificationDetailed::InvalidCaSignature);
+
+                            match detailed {
+                                IssuerCertificationDetailed::Certified { organization_name } => {
+                                    v.issuer_certified = true;
+                                    v.organization_name = Some(organization_name);
+                                    v.issuer_unverified_reason = None;
+                                }
+                                _ => {
+                                    v.issuer_certified = false;
+                                    v.organization_name = None;
+                                    v.issuer_unverified_reason = issuer_unverified_reason(&detailed);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            v.issuer_certified = false;
+                            v.organization_name = None;
+                            v.issuer_unverified_reason = Some(format!("failed to fetch certs.json: {}", e));
+                        }
                     }
                 }
-                published
-            } else {
-                let maybe = self
-                    .rt
-                    .block_on(fetch_proof_from_peers(&peers, &vid))
-                    .map_err(|e| e.to_string())?;
-                let Some(p) = maybe else {
-                    self.verify_status = "not found".to_string();
-                    return Ok(());
-                };
-                if let Err(e) = storage.store_proof(&p) {
-                    if self.last_error.trim().is_empty() {
-                        self.last_error = format!("storage: {}", e);
-                    }
-                }
-                PublishedProof {
-                    proof: p,
-                    issuer_certificate_id: None,
-                }
             }
-        } else {
-            self.verify_status = "not found".to_string();
-            return Ok(());
-        };
 
-        verify_proof(&published.proof, content.as_deref()).map_err(|e| e.to_string())?;
-        let mut status = String::new();
-        status.push_str("valid\n");
-        status.push_str(&format!("verification_id={}\n", published.proof.verification_id));
-        status.push_str(&format!("timestamp={}\n", published.proof.timestamp.to_rfc3339()));
-        status.push_str(&format!(
-            "creator_public_key_base64={}\n",
-            base64::engine::general_purpose::STANDARD.encode(published.proof.creator_public_key)
-        ));
-        status.push_str(&format!(
-            "signature_base64={}\n",
-            base64::engine::general_purpose::STANDARD.encode(published.proof.signature.0)
-        ));
-        if let Some(id) = published.issuer_certificate_id.as_deref() {
-            status.push_str(&format!("issuer_certificate_id={}\n", id));
-
-            let (cert_detailed, fetch_err_reason) =
-                self.issuer_certification(id, &published.proof.creator_public_key);
-
-            match cert_detailed {
-                IssuerCertificationDetailed::Certified { organization_name } => {
-                    status.push_str("certified issuer\n");
-                    status.push_str(&format!("organization_name={}\n", organization_name));
-                    self.verify_view = Some(VerifyResultView {
-                        verification_id: published.proof.verification_id.clone(),
-                        timestamp_rfc3339: published.proof.timestamp.to_rfc3339(),
-                        creator_public_key_base64: base64::engine::general_purpose::STANDARD
-                            .encode(published.proof.creator_public_key),
-                        signature_base64: base64::engine::general_purpose::STANDARD
-                            .encode(published.proof.signature.0),
-                        issuer_certificate_id: Some(id.to_string()),
-                        issuer_certified: true,
-                        organization_name: Some(organization_name),
-                        issuer_unverified_reason: None,
-                    });
-                }
-                _ => {
-                    status.push_str("unverified issuer\n");
-                    self.verify_view = Some(VerifyResultView {
-                        verification_id: published.proof.verification_id.clone(),
-                        timestamp_rfc3339: published.proof.timestamp.to_rfc3339(),
-                        creator_public_key_base64: base64::engine::general_purpose::STANDARD
-                            .encode(published.proof.creator_public_key),
-                        signature_base64: base64::engine::general_purpose::STANDARD
-                            .encode(published.proof.signature.0),
-                        issuer_certificate_id: Some(id.to_string()),
-                        issuer_certified: false,
-                        organization_name: None,
-                        issuer_unverified_reason: fetch_err_reason
-                            .or_else(|| issuer_unverified_reason(&cert_detailed)),
-                    });
-                }
-            }
-        } else {
-            status.push_str("unverified issuer\n");
-            self.verify_view = Some(VerifyResultView {
-                verification_id: published.proof.verification_id.clone(),
-                timestamp_rfc3339: published.proof.timestamp.to_rfc3339(),
-                creator_public_key_base64: base64::engine::general_purpose::STANDARD
-                    .encode(published.proof.creator_public_key),
-                signature_base64: base64::engine::general_purpose::STANDARD
-                    .encode(published.proof.signature.0),
-                issuer_certificate_id: None,
-                issuer_certified: false,
-                organization_name: None,
-                issuer_unverified_reason: None,
-            });
-        }
-        self.verify_status = status;
-        Ok(())
+            let _ = gui_task_tx.send(GuiTaskMsg::VerifyDone { status, view });
+        });
     }
 }
 
 struct SyncNetworkCtx {
     bind: SocketAddr,
+    advertise_addr: Arc<Mutex<SocketAddr>>,
     max_peers: usize,
     peers_arc: Arc<RwLock<Vec<SocketAddr>>>,
     peer_graph: Arc<RwLock<HashMap<SocketAddr, Vec<SocketAddr>>>>,
@@ -1993,25 +2648,60 @@ struct SyncNetworkCtx {
     bootstrap_entries: Arc<Mutex<Vec<PeerEntry>>>,
     reachable_peers: Arc<Mutex<Vec<SocketAddr>>>,
     recent_peer_hits: Arc<Mutex<HashMap<SocketAddr, Instant>>>,
+    dial_diagnostics: Arc<Mutex<HashMap<SocketAddr, PeerDialStatus>>>,
     cnt_ui_status: Arc<Mutex<CntUiStatus>>,
+    observed_public_ip: Arc<Mutex<Option<IpAddr>>>,
     cnt_enabled: bool,
     cnt_report_only: bool,
     cnt_force_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    dial_cursor: Arc<AtomicUsize>,
 }
 
 struct CntReportCtx {
     bind: SocketAddr,
+    advertise_addr: Arc<Mutex<SocketAddr>>,
     peers_arc: Arc<RwLock<Vec<SocketAddr>>>,
     peer_graph: Arc<RwLock<HashMap<SocketAddr, Vec<SocketAddr>>>>,
     cnt_server: SocketAddr,
     bootstrap_entries: Arc<Mutex<Vec<PeerEntry>>>,
     cnt_ui_status: Arc<Mutex<CntUiStatus>>,
+    observed_public_ip: Arc<Mutex<Option<IpAddr>>>,
     cnt_enabled: bool,
     upload_gossip: bool,
 }
 
 async fn sync_network_once(ctx: SyncNetworkCtx) -> anyhow::Result<()> {
     let bind = ctx.bind;
+    let self_advertised = ctx
+        .advertise_addr
+        .lock()
+        .ok()
+        .map(|g| *g)
+        .unwrap_or(bind);
+
+    let observed_ip = ctx.observed_public_ip.lock().ok().and_then(|g| *g);
+    let self_public_bind = observed_ip.map(|ip| SocketAddr::new(ip, bind.port()));
+    let self_public_adv = observed_ip.map(|ip| SocketAddr::new(ip, self_advertised.port()));
+
+    // Decay peer failure scores over time.
+    {
+        let now = Instant::now();
+        if let Ok(mut m) = ctx.dial_diagnostics.lock() {
+            for s in m.values_mut() {
+                let last = s.last_score_decay.unwrap_or(now);
+                let elapsed = now.duration_since(last);
+                // every 30s, decay score by 10%
+                let steps = (elapsed.as_secs() / 30) as u32;
+                if steps > 0 {
+                    for _ in 0..steps {
+                        s.failure_score = (s.failure_score.saturating_mul(9)) / 10;
+                    }
+                    s.last_score_decay = Some(now);
+                }
+            }
+        }
+    }
+
     let snapshot = ctx.peers_arc.read().await.clone();
 
     let known_good_snapshot: Vec<SocketAddr> = {
@@ -2043,73 +2733,142 @@ async fn sync_network_once(ctx: SyncNetworkCtx) -> anyhow::Result<()> {
 
     let mut join_set = tokio::task::JoinSet::new();
     if !ctx.cnt_report_only {
-        let peers_to_ping: Vec<SocketAddr> = if snapshot.len() <= ctx.max_peers {
-            snapshot
-                .iter()
-                .copied()
-                .filter(|p| *p != bind)
-                .collect()
-        } else {
-            let last_hits = ctx
-                .recent_peer_hits
+        // Prefer peers that have previously succeeded a handshake.
+        let peers_to_ping: Vec<SocketAddr> = {
+            let mut peers = snapshot;
+            peers.retain(|p| *p != bind && *p != self_advertised && !is_invalid_peer_addr(*p));
+            if let Some(a) = self_public_bind {
+                peers.retain(|p| *p != a);
+            }
+            if let Some(a) = self_public_adv {
+                peers.retain(|p| *p != a);
+            }
+
+            let diag_snapshot: HashMap<SocketAddr, PeerDialStatus> = ctx
+                .dial_diagnostics
                 .lock()
-                .ok()
-                .map(|m| m.clone())
+                .map(|g| g.clone())
                 .unwrap_or_default();
-            let now = Instant::now();
-            let very_old = now
-                .checked_sub(Duration::from_secs(3600))
-                .unwrap_or(now);
-            let mut candidates: Vec<(SocketAddr, Instant)> = snapshot
-                .iter()
-                .copied()
-                .filter(|p| *p != bind)
-                .map(|p| (p, last_hits.get(&p).copied().unwrap_or(very_old)))
-                .collect();
-            candidates.sort_by_key(|(_, t)| *t);
-            candidates
-                .into_iter()
-                .take(ctx.max_peers)
-                .map(|(p, _)| p)
-                .collect()
+
+            peers.sort_by(|a, b| {
+                let sa = diag_snapshot.get(a);
+                let sb = diag_snapshot.get(b);
+
+                let a_ok = sa.and_then(|s| s.last_ok).is_some();
+                let b_ok = sb.and_then(|s| s.last_ok).is_some();
+                if a_ok != b_ok {
+                    return b_ok.cmp(&a_ok);
+                }
+
+                let a_score = sa.map(|s| s.failure_score).unwrap_or_default();
+                let b_score = sb.map(|s| s.failure_score).unwrap_or_default();
+                if a_score != b_score {
+                    return a_score.cmp(&b_score);
+                }
+
+                let a_last = sa.and_then(|s| s.last_attempt).unwrap_or(Instant::now());
+                let b_last = sb.and_then(|s| s.last_attempt).unwrap_or(Instant::now());
+                a_last.cmp(&b_last)
+            });
+
+            let peers: Vec<SocketAddr> = peers.into_iter().take(ctx.max_peers).collect();
+            let mut peers = peers;
+            drop_default_port_dupes(&mut peers);
+            let n = peers.len();
+            if n == 0 {
+                Vec::new()
+            } else {
+                let per_tick: usize = 5.min(n);
+                let start = ctx.dial_cursor.fetch_add(per_tick, Ordering::Relaxed);
+                let mut out = Vec::with_capacity(per_tick);
+                for i in 0..per_tick {
+                    out.push(peers[(start + i) % n]);
+                }
+                out
+            }
         };
 
         for peer in peers_to_ping.into_iter() {
             if peer == bind {
                 continue;
             }
+            if peer == self_advertised {
+                continue;
+            }
+            if self_public_bind.is_some_and(|a| peer == a) {
+                continue;
+            }
+            if self_public_adv.is_some_and(|a| peer == a) {
+                continue;
+            }
+
+            if let Ok(mut m) = ctx.dial_diagnostics.lock() {
+                let s = m.entry(peer).or_default();
+                s.last_attempt = Some(Instant::now());
+            }
+
             let known = known_good_snapshot.clone();
             let conn = connections_snapshot.clone();
-            join_set.spawn(async move { (peer, ping_peer(peer, bind, known, conn).await) });
+            join_set.spawn(async move {
+                let res = ping_peer_detailed(peer, bind, known, conn).await;
+                (peer, res)
+            });
         }
     }
 
     let mut reachable = Vec::new();
-    let mut dead: HashSet<SocketAddr> = HashSet::new();
     let mut newly_discovered: HashSet<SocketAddr> = HashSet::new();
     let mut conn_updates: Vec<PeerConnections> = Vec::new();
 
     if !ctx.cnt_report_only {
         while let Some(join_res) = join_set.join_next().await {
             match join_res {
-                Ok((peer, Ok((peer_list, conn_graph)))) => {
+                Ok((peer, Ok((peer_list, conn_graph, observed_addr)))) => {
                     reachable.push(peer);
                     if let Ok(mut m) = ctx.recent_peer_hits.lock() {
                         m.insert(peer, Instant::now());
                     }
+
+                    if let Ok(mut m) = ctx.dial_diagnostics.lock() {
+                        let now = Instant::now();
+                        let s = m.entry(peer).or_default();
+                        s.last_result = Some(now);
+                        s.last_duration_ms = s
+                            .last_attempt
+                            .map(|t| now.duration_since(t).as_millis())
+                            .or(Some(0))
+                            .map(|v| v as u128);
+                        s.last_ok = Some(Instant::now());
+                        s.last_error = None;
+                        s.last_stage = Some("pong".to_string());
+                        s.last_stage_msg = None;
+                        s.ok_count = s.ok_count.saturating_add(1);
+                        s.consecutive_failures = 0;
+                        s.failure_score = s.failure_score / 2;
+                        s.last_score_decay = Some(now);
+                    }
+
+                    let observed_ip = observed_addr.ip();
+                    if !is_invalid_observed_ip(observed_ip) {
+                        if let Ok(mut g) = ctx.observed_public_ip.lock() {
+                            if g.map(|v| v != observed_ip).unwrap_or(true) {
+                                *g = Some(observed_ip);
+                            }
+                        }
+                    }
                     for p in peer_list {
-                        if p == bind {
+                        if p == bind || is_invalid_peer_addr(p) {
                             continue;
                         }
                         newly_discovered.insert(p);
                     }
 
                     for pc in conn_graph.iter() {
-                        if pc.addr != bind {
+                        if pc.addr != bind && !is_invalid_peer_addr(pc.addr) {
                             newly_discovered.insert(pc.addr);
                         }
                         for p in pc.connected_peers.iter().copied() {
-                            if p == bind {
+                            if p == bind || is_invalid_peer_addr(p) {
                                 continue;
                             }
                             newly_discovered.insert(p);
@@ -2120,10 +2879,31 @@ async fn sync_network_once(ctx: SyncNetworkCtx) -> anyhow::Result<()> {
                         conn_updates.extend(conn_graph);
                     }
                 }
-                Ok((peer, Err(_))) => {
-                    dead.insert(peer);
+                Ok((peer, Err(e))) => {
+                    let now = Instant::now();
+                    if let Ok(mut m) = ctx.dial_diagnostics.lock() {
+                        let s = m.entry(peer).or_default();
+                        s.last_result = Some(now);
+                        s.last_duration_ms = s
+                            .last_attempt
+                            .map(|t| now.duration_since(t).as_millis())
+                            .or(Some(0))
+                            .map(|v| v as u128);
+
+                        s.last_ok = None;
+                        s.last_stage = Some(format!("{:?}", e.stage));
+                        s.last_stage_msg = Some(e.message.clone());
+                        s.last_error = Some(format!("{}", e.message));
+
+                        s.err_count = s.err_count.saturating_add(1);
+                        s.consecutive_failures = s.consecutive_failures.saturating_add(1);
+                        s.failure_score = s.failure_score.saturating_add(10);
+                        s.last_score_decay = Some(now);
+                    }
                 }
-                Err(_) => {}
+                Err(_join_err) => {
+                    // Treat task join errors as dial failures (rare).
+                }
             }
         }
 
@@ -2139,23 +2919,7 @@ async fn sync_network_once(ctx: SyncNetworkCtx) -> anyhow::Result<()> {
             }
         }
 
-        if !dead.is_empty() {
-            let mut set = ctx.peers_arc.write().await;
-            set.retain(|p| !dead.contains(p));
-            let mut g = ctx.peer_graph.write().await;
-            for d in dead.iter() {
-                g.remove(d);
-            }
-            for peers in g.values_mut() {
-                peers.retain(|p| !dead.contains(p));
-            }
-
-            if let Ok(mut m) = ctx.recent_peer_hits.lock() {
-                for d in dead.iter() {
-                    m.remove(d);
-                }
-            }
-        }
+        // We do not prune peers purely due to dial failures.
 
         if !newly_discovered.is_empty() {
             let mut set = ctx.peers_arc.write().await;
@@ -2164,6 +2928,11 @@ async fn sync_network_once(ctx: SyncNetworkCtx) -> anyhow::Result<()> {
                     set.push(p);
                 }
             }
+            drop_default_port_dupes(&mut set);
+        }
+
+        if let Ok(mut g) = ctx.reachable_peers.lock() {
+            *g = reachable.clone();
         }
     }
 
@@ -2219,6 +2988,59 @@ async fn cnt_report_once(ctx: CntReportCtx) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let is_local_cnt = ctx.cnt_server.ip().is_loopback();
+    let reported_addr = if is_local_cnt {
+        ctx.bind
+    } else {
+        // Prefer the node's advertised address (UPnP updates this to the external mapped addr).
+        let advertised = ctx
+            .advertise_addr
+            .lock()
+            .ok()
+            .map(|g| *g)
+            .unwrap_or(ctx.bind);
+        let port = if advertised.port() != 0 {
+            advertised.port()
+        } else {
+            ctx.bind.port()
+        };
+
+        let candidate = if !is_unroutable_ip(advertised.ip()) {
+            advertised
+        } else if let Ok(ip_opt) = ctx.observed_public_ip.lock().map(|g| *g) {
+            if let Some(ip) = ip_opt {
+                if !is_unroutable_ip(ip) {
+                    SocketAddr::new(ip, port)
+                } else {
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)
+                }
+            } else {
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)
+            }
+        } else {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port)
+        };
+
+        if candidate.ip().is_unspecified() {
+            if let Some(local_ip) = detect_local_ip_to(ctx.cnt_server) {
+                SocketAddr::new(local_ip, port)
+            } else {
+                candidate
+            }
+        } else {
+            candidate
+        }
+    };
+
+    if !is_local_cnt && is_unroutable_ip(reported_addr.ip()) {
+        if let Ok(mut s) = ctx.cnt_ui_status.lock() {
+            s.last_error = Some(
+                "CNT warning: reporting may be rejected (no routable public address; check UPnP/port-forward)"
+                    .to_string(),
+            );
+        }
+    }
+
     let stable_hint = ctx
         .cnt_ui_status
         .lock()
@@ -2237,52 +3059,90 @@ async fn cnt_report_once(ctx: CntReportCtx) -> anyhow::Result<()> {
 
     let report = if send_gossip {
         PeerReport {
-            addr: ctx.bind,
+            addr: if is_local_cnt { ctx.bind } else { reported_addr },
             known_peers: connected_peers.clone(),
             connected_peers: connected_peers.clone(),
         }
     } else {
         PeerReport {
-            addr: ctx.bind,
+            addr: if is_local_cnt { ctx.bind } else { reported_addr },
             known_peers: Vec::new(),
             connected_peers: Vec::new(),
         }
     };
 
     match report_and_get_peers(ctx.cnt_server, report).await {
-        Ok((entries, requester_stable)) => {
+        Ok((entries, requester_stable, requester_effective_addr)) => {
             if let Ok(mut s) = ctx.cnt_ui_status.lock() {
                 s.last_ok = Some(Instant::now());
                 s.last_error = None;
                 s.last_entry_count = entries.len();
                 s.requester_stable = requester_stable;
             }
-            if let Ok(mut guard) = ctx.bootstrap_entries.lock() {
-                *guard = entries.clone();
+            if let Ok(mut g) = ctx.bootstrap_entries.lock() {
+                *g = entries.clone();
             }
 
-            let mut set = ctx.peers_arc.write().await;
+            let mut stable_addrs: Vec<SocketAddr> = Vec::new();
+            let mut unstable_addrs: Vec<SocketAddr> = Vec::new();
+
+            let self_advertised = ctx
+                .advertise_addr
+                .lock()
+                .ok()
+                .map(|g| *g)
+                .unwrap_or(ctx.bind);
+            let observed_ip = ctx.observed_public_ip.lock().ok().and_then(|g| *g);
+            let self_public_bind = observed_ip.map(|ip| SocketAddr::new(ip, ctx.bind.port()));
+            let self_public_adv = observed_ip.map(|ip| SocketAddr::new(ip, self_advertised.port()));
+            let self_reported_addr = if is_local_cnt {
+                ctx.bind
+            } else {
+                requester_effective_addr
+            };
+
             for e in entries {
                 if e.addr == ctx.bind {
                     continue;
                 }
-
-                let mut discovered: std::collections::HashSet<SocketAddr> =
-                    std::collections::HashSet::new();
-                discovered.insert(e.addr);
-                for p in e.connected_peers.iter().copied() {
-                    discovered.insert(p);
+                if e.addr == self_advertised {
+                    continue;
                 }
+                if e.addr == self_reported_addr {
+                    continue;
+                }
+                if self_public_bind.is_some_and(|a| e.addr == a) {
+                    continue;
+                }
+                if self_public_adv.is_some_and(|a| e.addr == a) {
+                    continue;
+                }
+                if e.stable {
+                    stable_addrs.push(e.addr);
+                } else {
+                    unstable_addrs.push(e.addr);
+                }
+            }
 
-                for p in discovered.into_iter() {
-                    if p == ctx.bind {
-                        continue;
-                    }
-                    if !set.contains(&p) {
-                        set.push(p);
+            let mut set = ctx.peers_arc.write().await;
+
+            for a in stable_addrs.into_iter() {
+                if !set.contains(&a) {
+                    set.push(a);
+                }
+            }
+
+            // If CNT has not yet classified any peer as stable, we still need a few dial targets
+            // to bootstrap sessions. Keep this small to avoid spam.
+            if is_local_cnt || set.is_empty() {
+                for a in unstable_addrs.into_iter().take(2) {
+                    if !set.contains(&a) {
+                        set.push(a);
                     }
                 }
             }
+
+            drop_default_port_dupes(&mut set);
         }
         Err(e) => {
             if let Ok(mut s) = ctx.cnt_ui_status.lock() {
@@ -2317,6 +3177,78 @@ fn resolve_socket_addr(s: &str) -> Option<SocketAddr> {
     s.to_socket_addrs().ok()?.next()
 }
 
+fn detect_local_ip() -> Option<IpAddr> {
+    // No packets are sent for UDP "connect"; it just picks a default route.
+    // This yields the local interface IP used for outbound traffic.
+    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("8.8.8.8:80").ok()?;
+    Some(sock.local_addr().ok()?.ip())
+}
+
+fn detect_local_ip_to(remote: SocketAddr) -> Option<IpAddr> {
+    // No packets are sent for UDP "connect"; it just picks a default route.
+    // Use the CNT server as the route target so we get the right interface IP.
+    let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect(remote).ok()?;
+    Some(sock.local_addr().ok()?.ip())
+}
+
+fn is_unroutable_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            if v4.is_loopback() || v4.is_unspecified() {
+                return true;
+            }
+            let o = v4.octets();
+            // RFC1918 + link-local
+            (o[0] == 10)
+                || (o[0] == 172 && (16..=31).contains(&o[1]))
+                || (o[0] == 192 && o[1] == 168)
+                || (o[0] == 169 && o[1] == 254)
+                || (o[0] == 100 && (64..=127).contains(&o[1]))
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() {
+                return true;
+            }
+            let seg0 = v6.segments()[0];
+            // Unique local: fc00::/7
+            if (seg0 & 0xfe00) == 0xfc00 {
+                return true;
+            }
+            // Link-local unicast: fe80::/10
+            if (seg0 & 0xffc0) == 0xfe80 {
+                return true;
+            }
+            false
+        }
+    }
+}
+
+fn is_invalid_peer_addr(a: SocketAddr) -> bool {
+    is_invalid_peer_ip(a.ip()) || a.port() == 0
+}
+
+fn is_invalid_peer_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified() || v4.is_multicast() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() || v6.is_unicast_link_local()
+        }
+    }
+}
+
+fn is_invalid_observed_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_unspecified() || v4.is_multicast() || v4.is_link_local()
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() || v6.is_unicast_link_local()
+        }
+    }
+}
+
 fn parse_asset_type(s: &str) -> std::result::Result<AssetType, String> {
     match s.trim().to_ascii_lowercase().as_str() {
         "text" => Ok(AssetType::Text),
@@ -2335,7 +3267,16 @@ fn parse_peers(peers: &str) -> std::result::Result<Vec<SocketAddr>, String> {
         if p.is_empty() {
             continue;
         }
-        out.push(p.parse::<SocketAddr>().map_err(|_| "invalid peer".to_string())?);
+        if let Ok(addr) = p.parse::<SocketAddr>() {
+            if is_invalid_peer_addr(addr) {
+                continue;
+            }
+            out.push(addr);
+        } else if p.parse::<IpAddr>().is_ok() {
+            return Err("peer missing port (use ip:port)".to_string());
+        } else {
+            return Err("invalid peer".to_string());
+        }
     }
     Ok(out)
 }

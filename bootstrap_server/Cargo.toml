@@ -15,3 +15,5 @@ crossterm = "0.29"
 ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time", "signal"] }
+futures = "0.3"
+libp2p = { version = "0.53", default-features = false, features = ["tokio", "tcp", "dns", "identify", "gossipsub", "yamux", "noise", "macros"] }
