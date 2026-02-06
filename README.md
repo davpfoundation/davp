@@ -1,14 +1,20 @@
+> [!WARNING]
+> This is not feature-complete and its protocol, storage, and networking behavior may change without notice. Do not rely on it for production or long-term guarantees yet. Support state will indicated when the first release publishes.
+
 # DAVP
 
 Decentralized Asset Verification Protocol. DAVP is a program and protocol implementation for creating, storing, verifying, and replicating cryptographic proofs about arbitrary digital content (assets).
 
-> DAVP was created because there wasn’t a simple way to prove that a file or piece of content really came from someone at a certain time. Most systems rely on central servers or authorities, which can go down, be hacked, or lie. With DAVP, you can create a proof locally, sign it with your key, and anyone can check it later, or even offline. You can also share proofs with other peers or link them to known issuers, without the need for a blockchain or a central authority. 
+> DAVP was created because there wasn’t a simple way to prove that a file or piece of content really came from someone at a certain time. Most systems rely on **central servers** or **authorities**, which can **go down**, **be hacked**, or **lie**. With DAVP, you can create a proof locally, sign it with your key, and anyone can check it later, or even offline. You can also share proofs with other peers or link them to known issuers, **without** the need for a blockchain or a central authority. 
+
 
 ## Demonstration
 <p align="center">
   <img src="https://raw.githubusercontent.com/davpfoundation/davp/refs/heads/main/docs/davp_demonstration.png">
 </p>
 <p align="center"><i>Demo representation of DAVP in GUI mode</i></p>
+
+
 
 ## How it works
 
