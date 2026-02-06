@@ -666,6 +666,7 @@ async fn cli_main(cli: Cli) -> Result<()> {
 
                         let report = PeerReport {
                             addr: advertised_for_cnt,
+                            upnp_enabled: false,
                             known_peers: connected.clone(),
                             connected_peers: connected,
                         };

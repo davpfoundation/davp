@@ -1517,6 +1517,7 @@ impl DavpApp {
 
         if upnp_enabled {
             let advertise_addr = Arc::clone(&advertise_addr);
+            let upnp_mapped_addr_upnp = Arc::clone(&upnp_mapped_addr);
             self.rt.spawn(async move {
                 if let Ok(mut g) = upnp_status_line.lock() {
                     *g = "UPnP: searching gateway...".to_string();
@@ -1585,7 +1586,7 @@ impl DavpApp {
                 }
 
                 if let Some(mapped) = mapped {
-                    if let Ok(mut g) = upnp_mapped_addr.lock() {
+                    if let Ok(mut g) = upnp_mapped_addr_upnp.lock() {
                         *g = Some(mapped);
                     }
                     if !is_unroutable_ip(mapped.ip()) {
@@ -1740,6 +1741,8 @@ let dial_cursor = Arc::new(AtomicUsize::new(0));
                                 advertise_addr: Arc::clone(&advertise_addr_cnt),
                                 peers_arc: Arc::clone(&peers_arc_cnt),
                                 peer_graph: Arc::clone(&peer_graph_cnt),
+                                upnp_enabled,
+                                upnp_mapped_addr: Arc::clone(&upnp_mapped_addr),
                                 cnt_server,
                                 bootstrap_entries: Arc::clone(&bootstrap_entries_cnt),
                                 cnt_ui_status: Arc::clone(&cnt_ui_status_cnt),
@@ -1757,6 +1760,8 @@ let dial_cursor = Arc::new(AtomicUsize::new(0));
                             advertise_addr: Arc::clone(&advertise_addr_cnt),
                             peers_arc: Arc::clone(&peers_arc_cnt),
                             peer_graph: Arc::clone(&peer_graph_cnt),
+                            upnp_enabled,
+                            upnp_mapped_addr: Arc::clone(&upnp_mapped_addr),
                             cnt_server,
                             bootstrap_entries: Arc::clone(&bootstrap_entries_cnt),
                             cnt_ui_status: Arc::clone(&cnt_ui_status_cnt),
@@ -2662,6 +2667,8 @@ struct CntReportCtx {
     advertise_addr: Arc<Mutex<SocketAddr>>,
     peers_arc: Arc<RwLock<Vec<SocketAddr>>>,
     peer_graph: Arc<RwLock<HashMap<SocketAddr, Vec<SocketAddr>>>>,
+    upnp_enabled: bool,
+    upnp_mapped_addr: Arc<Mutex<Option<SocketAddr>>>,
     cnt_server: SocketAddr,
     bootstrap_entries: Arc<Mutex<Vec<PeerEntry>>>,
     cnt_ui_status: Arc<Mutex<CntUiStatus>>,
@@ -3057,15 +3064,25 @@ async fn cnt_report_once(ctx: CntReportCtx) -> anyhow::Result<()> {
         Vec::new()
     };
 
+    let upnp_enabled = ctx.upnp_enabled
+        && ctx
+            .upnp_mapped_addr
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .is_some();
+
     let report = if send_gossip {
         PeerReport {
             addr: if is_local_cnt { ctx.bind } else { reported_addr },
+            upnp_enabled,
             known_peers: connected_peers.clone(),
             connected_peers: connected_peers.clone(),
         }
     } else {
         PeerReport {
             addr: if is_local_cnt { ctx.bind } else { reported_addr },
+            upnp_enabled,
             known_peers: Vec::new(),
             connected_peers: Vec::new(),
         }

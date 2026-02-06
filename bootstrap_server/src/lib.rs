@@ -144,6 +144,8 @@ pub async fn run_p2p_hub(bind: SocketAddr, shutdown: &mut watch::Receiver<bool>)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerReport {
     pub addr: SocketAddr,
+    #[serde(default)]
+    pub upnp_enabled: bool,
     pub known_peers: Vec<SocketAddr>,
     pub connected_peers: Vec<SocketAddr>,
 }
@@ -260,6 +262,7 @@ struct PeerState {
     last_seen: DateTime<Utc>,
     stable: bool,
     reported: bool,
+    upnp_enabled: bool,
     active_inferred: bool,
     known_peers: Vec<SocketAddr>,
     connected_peers: Vec<SocketAddr>,
@@ -508,6 +511,7 @@ async fn handle_client(
                         last_seen: now,
                         stable: stable_on_insert,
                         reported: true,
+                        upnp_enabled: report.upnp_enabled,
                         active_inferred: true,
                         known_peers: Vec::new(),
                         connected_peers: Vec::new(),
@@ -515,6 +519,7 @@ async fn handle_client(
 
                     entry.reported = true;
                     entry.last_seen = now;
+                    entry.upnp_enabled = report.upnp_enabled;
 
                     // Treat empty lists as presence-only so a client can query its stable status
                     // without wiping previously stored gossip.
@@ -548,6 +553,7 @@ async fn handle_client(
                                 last_seen: now,
                                 stable: false,
                                 reported: false,
+                                upnp_enabled: false,
                                 active_inferred: true,
                                 known_peers: Vec::new(),
                                 connected_peers: Vec::new(),
@@ -565,6 +571,7 @@ async fn handle_client(
                             last_seen: now,
                             stable: false,
                             reported: false,
+                            upnp_enabled: false,
                             active_inferred: false,
                             known_peers: Vec::new(),
                             connected_peers: Vec::new(),
@@ -600,11 +607,25 @@ fn elect_stable_if_needed(map: &mut HashMap<SocketAddr, PeerState>, now: DateTim
         return;
     }
 
+    // Stable peers must be UPnP-enabled (eligible for inbound reachability).
+    let any_eligible = map.values().any(|st| st.reported && st.upnp_enabled);
+    if !any_eligible {
+        for st in map.values_mut() {
+            st.stable = false;
+        }
+        return;
+    }
+
     // If we already have a stable peer that has reached the stable-after threshold,
     // keep it to avoid unnecessary churn.
     if map
         .values()
-        .any(|st| st.reported && st.stable && (now - st.first_seen) >= STABLE_AFTER)
+        .any(|st| {
+            st.reported
+                && st.upnp_enabled
+                && st.stable
+                && (now - st.first_seen) >= STABLE_AFTER
+        })
     {
         return;
     }
@@ -627,7 +648,7 @@ fn elect_stable_if_needed(map: &mut HashMap<SocketAddr, PeerState>, now: DateTim
         let mut selected_first_seen: Option<DateTime<Utc>> = None;
 
         for (addr, st) in map.iter() {
-            if !st.reported {
+            if !st.reported || !st.upnp_enabled {
                 continue;
             }
             if require_stable_after && (now - st.first_seen) < STABLE_AFTER {

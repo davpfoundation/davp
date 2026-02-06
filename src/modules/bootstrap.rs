@@ -11,6 +11,8 @@ const IO_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerReport {
     pub addr: SocketAddr,
+    #[serde(default)]
+    pub upnp_enabled: bool,
     pub known_peers: Vec<SocketAddr>,
     pub connected_peers: Vec<SocketAddr>,
 }
