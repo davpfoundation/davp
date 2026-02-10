@@ -4,7 +4,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-pub const DEFAULT_CERTS_URL: &str = "https://davpfoundation.github.io/certs.json";
+pub use crate::config::DEFAULT_CERTS_URL;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IssuerCertificateBundle {

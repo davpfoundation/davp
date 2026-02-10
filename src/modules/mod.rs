@@ -5,6 +5,7 @@ pub mod certification;
 pub mod hash;
 pub mod issuer_certificate;
 pub mod metadata;
+pub mod net_utils;
 pub mod network;
 pub mod settings;
 pub mod signature;

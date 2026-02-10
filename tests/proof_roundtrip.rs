@@ -1,3 +1,5 @@
+// for testing only
+
 use davp::modules::asset::create_proof_from_bytes;
 use davp::modules::metadata::{AssetType, Metadata};
 use davp::modules::storage::Storage;

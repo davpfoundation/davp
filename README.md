@@ -80,6 +80,8 @@ CNT is not a trusted authority. It is a hint system only.
 - **Discovery is not trust.** Proof authenticity is verified locally by each node.
 - **Fake peers are expected.** A Sybil attacker can flood CNT with random/unreachable addresses. This does not break proof security; it only wastes connection attempts.
 
+
+
 Node behavior:
 
 - Always try connecting to a peer before treating it as usable.
@@ -92,3 +94,10 @@ CNT hygiene:
 - Reports are stored with a short TTL (minutes, configurable).
 - CNT rate-limits reports per source IP.
 - CNT caps total stored entries to prevent unbounded growth.
+
+### Demonstration
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/davpfoundation/davp/refs/heads/main/docs/cnt_demonstration.png">
+</p>
+<p align="center"><i>Demo representation of CNT</i></p>

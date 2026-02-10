@@ -1,3 +1,5 @@
+// for testing only
+
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use davp::modules::issuer_certificate::{
     verify_issuer_certificate, IssuerCertificate, IssuerCertificationStatus,

@@ -5,7 +5,10 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-const DEFAULT_DATA_DIR: &str = "davp_storage";
+use crate::config::{
+    DEFAULT_CERTS_URL, DEFAULT_CNT_TRACKER_ADDR, DEFAULT_CREATE_ASSET_TYPE, DEFAULT_DATA_DIR,
+    DEFAULT_NODE_BIND,
+};
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct CntTrackerEntry {
@@ -75,15 +78,15 @@ fn default_max_peers() -> usize {
 }
 
 fn default_cnt_selected_addr() -> String {
-    "cnt.unitedorigins.com:5157".to_string()
+    DEFAULT_CNT_TRACKER_ADDR.to_string()
 }
 
 fn default_certs_url() -> String {
-    "https://davpfoundation.github.io/certs.json".to_string()
+    DEFAULT_CERTS_URL.to_string()
 }
 
 fn default_create_asset_type() -> String {
-    "other".to_string()
+    DEFAULT_CREATE_ASSET_TYPE.to_string()
 }
 
 impl Default for AppConfig {
@@ -93,7 +96,7 @@ impl Default for AppConfig {
             auto_save: true,
 
             peers: String::new(),
-            node_bind: "0.0.0.0:9001".to_string(),
+            node_bind: DEFAULT_NODE_BIND.to_string(),
             advertise_addr: String::new(),
             upnp_enabled: false,
             max_peers: default_max_peers(),

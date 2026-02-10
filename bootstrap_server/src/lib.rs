@@ -1,6 +1,7 @@
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::net::IpAddr;
@@ -10,6 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::sync::watch;
+use tokio::sync::Mutex;
 use tokio::sync::RwLock;
 use tokio::time::{interval, timeout};
 
@@ -34,6 +36,21 @@ const MAX_RATE_LIMIT_IPS: usize = 20_000;
 const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 const DAVP_PROOF_TOPIC: &str = "davp.proofs.v1";
+
+fn push_log(logs: &Arc<Mutex<VecDeque<String>>>, line: String) {
+    const MAX_LINES: usize = 500;
+    let logs = Arc::clone(logs);
+    tokio::spawn(async move {
+        let mut l = logs.lock().await;
+        if l.len() >= MAX_LINES {
+            let to_drop = (l.len() + 1).saturating_sub(MAX_LINES);
+            for _ in 0..to_drop {
+                let _ = l.pop_front();
+            }
+        }
+        l.push_back(line);
+    });
+}
 
 fn rewrite_192_168_to_public_ip(addr: SocketAddr, public_ip: Option<IpAddr>) -> SocketAddr {
     let Some(public_ip) = public_ip else {
@@ -278,11 +295,17 @@ struct RateLimitState {
 pub struct CntServerHandle {
     peers: Arc<RwLock<HashMap<SocketAddr, PeerState>>>,
     ttl: Duration,
+    logs: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl CntServerHandle {
     pub async fn entries(&self) -> Vec<PeerEntry> {
         build_peer_entries(&self.peers, self.ttl, true).await
+    }
+
+    pub async fn logs(&self) -> Vec<String> {
+        let l = self.logs.lock().await;
+        l.iter().cloned().collect()
     }
 }
 
@@ -301,6 +324,7 @@ pub async fn start_server_with_shutdown(
     let ttl = Duration::seconds(ttl_seconds.max(5));
 
     let peers: Arc<RwLock<HashMap<SocketAddr, PeerState>>> = Arc::new(RwLock::new(HashMap::new()));
+    let logs: Arc<Mutex<VecDeque<String>>> = Arc::new(Mutex::new(VecDeque::new()));
     let rate_limits: Arc<RwLock<HashMap<IpAddr, RateLimitState>>> =
         Arc::new(RwLock::new(HashMap::new()));
     let conn_limit = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
@@ -309,6 +333,7 @@ pub async fn start_server_with_shutdown(
     let accept_peers = Arc::clone(&peers);
     let accept_conn_limit = Arc::clone(&conn_limit);
     let accept_rate_limits = Arc::clone(&rate_limits);
+    let accept_logs = Arc::clone(&logs);
     let mut accept_shutdown = shutdown.clone();
     let allow_loopback_cfg = allow_loopback;
     let public_ip_cfg = public_ip;
@@ -332,6 +357,7 @@ pub async fn start_server_with_shutdown(
 
             let peers = Arc::clone(&accept_peers);
             let rate_limits = Arc::clone(&accept_rate_limits);
+            let logs = Arc::clone(&accept_logs);
             let permit = match Arc::clone(&accept_conn_limit).acquire_owned().await {
                 Ok(p) => p,
                 Err(_) => break,
@@ -343,6 +369,7 @@ pub async fn start_server_with_shutdown(
                     remote_addr,
                     peers,
                     rate_limits,
+                    logs,
                     ttl,
                     allow_loopback_cfg,
                     public_ip_cfg,
@@ -371,7 +398,7 @@ pub async fn start_server_with_shutdown(
         }
     });
 
-    Ok(CntServerHandle { peers, ttl })
+    Ok(CntServerHandle { peers, ttl, logs })
 }
 
 pub async fn run_server_with_shutdown(
@@ -400,6 +427,7 @@ async fn handle_client(
     remote_addr: SocketAddr,
     peers: Arc<RwLock<HashMap<SocketAddr, PeerState>>>,
     rate_limits: Arc<RwLock<HashMap<IpAddr, RateLimitState>>>,
+    logs: Arc<Mutex<VecDeque<String>>>,
     ttl: Duration,
     allow_loopback: bool,
     public_ip: Option<IpAddr>,
@@ -426,7 +454,13 @@ async fn handle_client(
             // This prevents accidental pollution of CNT World with 127.0.0.1 / RFC1918 / link-local.
             let allow_this_unroutable = allow_loopback && (effective_addr.ip().is_loopback() || is_unroutable_ip(effective_addr.ip()));
             if is_unroutable_socket_addr(effective_addr) && !allow_this_unroutable {
-                println!("CNT: rejecting unroutable report from {} (effective_addr={})", remote_addr, effective_addr);
+                push_log(
+                    &logs,
+                    format!(
+                        "CNT: rejecting unroutable report from {} (effective_addr={})",
+                        remote_addr, effective_addr
+                    ),
+                );
                 write_message(
                     &mut stream,
                     &Message::Peers(PeersResponse {
@@ -582,7 +616,15 @@ async fn handle_client(
                 elect_stable_if_needed(&mut map, now);
 
                 requester_stable = map.get(&effective_addr).map(|st| st.stable).unwrap_or(false);
-                println!("CNT: accepted report from {} (effective_addr={}), total_peers={}", remote_addr, effective_addr, map.len());
+                push_log(
+                    &logs,
+                    format!(
+                        "CNT: accepted report from {} (effective_addr={}), total_peers={}",
+                        remote_addr,
+                        effective_addr,
+                        map.len()
+                    ),
+                );
             }
 
             let list = build_peer_entries(&peers, ttl, requester_stable).await;

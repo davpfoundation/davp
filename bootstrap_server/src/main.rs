@@ -7,7 +7,7 @@ use crossterm::terminal::{
 use crossterm::ExecutableCommand;
 use davp_bootstrap_server::start_server_with_shutdown;
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Cell, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 use std::io::{stdout, Stdout};
 use std::net::IpAddr;
 use std::net::SocketAddr;
@@ -108,6 +108,7 @@ async fn run_tui(
         }
 
         let entries = server.entries().await;
+        let logs = server.logs().await;
         let now = chrono::Utc::now();
 
         terminal.draw(|f| {
@@ -121,6 +122,11 @@ async fn run_tui(
                 .borders(Borders::ALL);
             let inner = block.inner(area);
             f.render_widget(block, area);
+
+            let layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Percentage(67), Constraint::Percentage(33)])
+                .split(inner);
 
             let header = Row::new(vec![
                 Cell::from("addr"),
@@ -164,7 +170,14 @@ async fn run_tui(
             .header(header)
             .block(Block::default().borders(Borders::ALL).title("Active peers"));
 
-            f.render_widget(table, inner);
+            f.render_widget(table, layout[0]);
+
+            let log_text = logs.join("\n");
+            let log_widget = Paragraph::new(log_text)
+                .block(Block::default().borders(Borders::ALL).title("Log"))
+                .wrap(Wrap { trim: false })
+                .scroll(((logs.len().saturating_sub(layout[1].height as usize - 2)) as u16, 0));
+            f.render_widget(log_widget, layout[1]);
         })?;
 
         tokio::select! {

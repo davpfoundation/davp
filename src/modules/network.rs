@@ -1,8 +1,3 @@
-use crate::modules::asset::Proof;
-use crate::modules::certification::PublishedProof;
-use crate::modules::hash::AssetHash;
-use crate::modules::storage::Storage;
-use crate::modules::verification::verify_proof;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -11,10 +6,15 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
-use tokio::sync::watch;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, watch, RwLock};
 use tokio::time::{timeout, Duration};
+
+use crate::modules::asset::Proof;
+use crate::modules::certification::PublishedProof;
+use crate::modules::hash::AssetHash;
+use crate::modules::net_utils::is_invalid_peer_addr;
+use crate::modules::storage::Storage;
+use crate::modules::verification::verify_proof;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -817,24 +817,6 @@ async fn read_message<R: AsyncReadExt + Unpin>(stream: &mut R) -> Result<Message
     let mut buf = vec![0u8; len];
     timeout(IO_TIMEOUT, stream.read_exact(&mut buf)).await??;
     Ok(bincode::deserialize::<Message>(&buf)?)
-}
-
-fn is_invalid_peer_addr(a: SocketAddr) -> bool {
-    is_invalid_peer_ip(a.ip()) || a.port() == 0
-}
-
-fn is_invalid_peer_ip(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            v4.is_loopback() || v4.is_unspecified() || v4.is_multicast() || v4.is_link_local()
-        }
-        std::net::IpAddr::V6(v6) => {
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || v6.is_unicast_link_local()
-        }
-    }
 }
 
 async fn merge_peers(

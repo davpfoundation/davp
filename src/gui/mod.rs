@@ -7,9 +7,12 @@ use crate::modules::certification::PublishedProof;
 use crate::modules::hash::blake3_hash_bytes;
 use crate::modules::issuer_certificate::{
     fetch_certificate_bundle, verify_issuer_certificate_detailed, IssuerCertificateBundle,
-    IssuerCertificationDetailed, DEFAULT_CERTS_URL,
+    IssuerCertificationDetailed,
 };
 use crate::modules::metadata::{AssetType, Metadata};
+use crate::modules::net_utils::{
+    is_invalid_observed_ip, is_invalid_peer_addr, is_unroutable_ip,
+};
 use crate::modules::network::{
     connected_session_peers, fetch_proof_from_peers, fetch_published_proof_from_peers,
     ping_peer_detailed, replicate_proof, replicate_published_proof, run_node_with_shutdown,
@@ -19,6 +22,10 @@ use crate::modules::settings::{AppConfig, CntTrackerEntry};
 use crate::modules::storage::Storage;
 use crate::modules::verification::verify_proof;
 use crate::p2p::{run_p2p, OutboundMsg};
+use crate::config::{
+    DEFAULT_CERTS_URL, DEFAULT_CNT_TRACKER_ADDR, DEFAULT_CREATE_ASSET_TYPE, DEFAULT_DATA_DIR,
+    DEFAULT_NODE_BIND,
+};
 use crate::KeypairBytes;
 use eframe::egui;
 use igd_next::aio::tokio as igd_tokio;
@@ -150,6 +157,7 @@ struct DavpApp {
     config_export_path: String,
 
     peers: String,
+    seed_peers_bulk_edit: bool,
     seed_peers_last_applied: String,
     seed_peers_last_error: String,
 
@@ -172,6 +180,7 @@ struct DavpApp {
     upnp_status_line: Arc<Mutex<String>>,
     upnp_external_ip: Arc<Mutex<Option<IpAddr>>>,
     upnp_mapped_addr: Arc<Mutex<Option<SocketAddr>>>,
+    upnp_handle: Option<tokio::task::JoinHandle<()>>,
     max_peers: usize,
 
     networking_started: bool,
@@ -258,31 +267,33 @@ impl Default for DavpApp {
 
         Self {
             tab: Tab::Workspace,
-            storage_dir: "davp_storage".to_string(),
+            storage_dir: DEFAULT_DATA_DIR.to_string(),
             config_import_path: String::new(),
             config_export_path: String::new(),
             peers: "".to_string(),
+            seed_peers_bulk_edit: false,
             seed_peers_last_applied: String::new(),
             seed_peers_last_error: String::new(),
-            cnt_server: "cnt.unitedorigins.com:5157".to_string(),
+            cnt_server: DEFAULT_CNT_TRACKER_ADDR.to_string(),
             cnt_enabled: false,
 
-            cnt_selected_addr: "cnt.unitedorigins.com:5157".to_string(),
+            cnt_selected_addr: DEFAULT_CNT_TRACKER_ADDR.to_string(),
             cnt_trackers: Vec::new(),
             cnt_new_name: String::new(),
             cnt_new_addr: String::new(),
 
             node_port: 9001,
-            node_port_text: "*".to_string(),
+            node_port_text: "9001".to_string(),
             detected_ip: detect_local_ip().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)),
             observed_public_ip: Arc::clone(&observed_public_ip),
 
-            node_bind: "0.0.0.0:9001".to_string(),
+            node_bind: DEFAULT_NODE_BIND.to_string(),
             advertise_addr: String::new(),
             upnp_enabled: false,
             upnp_status_line: Arc::clone(&upnp_status_line),
             upnp_external_ip: Arc::clone(&upnp_external_ip),
             upnp_mapped_addr: Arc::clone(&upnp_mapped_addr),
+            upnp_handle: None,
             max_peers: 50,
             networking_started: false,
             networking_started_at: None,
@@ -314,7 +325,7 @@ impl Default for DavpApp {
             public_key_base64: String::new(),
 
             create_file_path: String::new(),
-            create_asset_type: "other".to_string(),
+            create_asset_type: DEFAULT_CREATE_ASSET_TYPE.to_string(),
             create_ai_assisted: false,
             create_description: String::new(),
             create_tags: String::new(),
@@ -407,7 +418,7 @@ impl eframe::App for DavpApp {
                         ));
                         ui.label(format!(
                             "Network: {}",
-                            if self.networking_started { "running" } else { "stopped" }
+                            if self.networking_started { "up" } else { "down" }
                         ));
                     });
                 });
@@ -468,27 +479,6 @@ impl eframe::App for DavpApp {
 impl DavpApp {
     const INPUT_WIDTH: f32 = 560.0;
 
-    fn normalize_node_port_text(&mut self) {
-        let t = self.node_port_text.trim();
-        if t == "*" {
-            self.node_port = 9001;
-            self.recompute_network_addrs();
-            return;
-        }
-        if t.is_empty() {
-            return;
-        }
-        if t.len() > 4 {
-            return;
-        }
-        if let Ok(v) = t.parse::<u16>() {
-            if (1..=9999).contains(&v) {
-                self.node_port = v;
-                self.recompute_network_addrs();
-            }
-        }
-    }
-
     fn recompute_network_addrs(&mut self) {
         self.node_bind = format!("0.0.0.0:{}", self.node_port);
         self.advertise_addr = format!("{}:{}", self.detected_ip, self.node_port);
@@ -496,8 +486,8 @@ impl DavpApp {
 
     fn all_cnt_trackers(&self) -> Vec<(String, String)> {
         let mut v = vec![
-            ("CNT World".to_string(), "cnt.unitedorigins.com:5157".to_string()),
-            ("Local World".to_string(), "127.0.0.1:5157".to_string()),
+            ("CNT World".to_string(), DEFAULT_CNT_TRACKER_ADDR.to_string()),
+            ("Local".to_string(), "127.0.0.1:5157".to_string()),
         ];
         for t in &self.cnt_trackers {
             v.push((t.name.clone(), t.addr.clone()));
@@ -594,11 +584,7 @@ impl DavpApp {
         if let Ok(a) = cfg.node_bind.parse::<SocketAddr>() {
             self.node_port = a.port();
         }
-        if self.node_port == 9001 {
-            self.node_port_text = "*".to_string();
-        } else {
-            self.node_port_text = self.node_port.to_string();
-        }
+        self.node_port_text = self.node_port.to_string();
         self.recompute_network_addrs();
         self.upnp_enabled = cfg.upnp_enabled;
         self.max_peers = cfg.max_peers;
@@ -615,7 +601,7 @@ impl DavpApp {
         {
             self.cnt_selected_addr = candidate.to_string();
         } else {
-            self.cnt_selected_addr = "cnt.unitedorigins.com:5157".to_string();
+            self.cnt_selected_addr = DEFAULT_CNT_TRACKER_ADDR.to_string();
         }
         self.cnt_server = self.cnt_selected_addr.clone();
 
@@ -692,16 +678,16 @@ impl DavpApp {
 
         ui.add_enabled_ui(!self.networking_started, |ui| {
             egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
                 ui.heading("Storage");
 
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Import config.json");
+                    let w = ui.available_width().clamp(160.0, 520.0);
+                    ui.add(egui::TextEdit::singleline(&mut self.config_import_path).desired_width(w));
+                });
 
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.config_import_path)
-                            .desired_width(420.0),
-                    );
-
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("Browse").clicked() {
                         if let Some(file) = rfd::FileDialog::new()
                             .add_filter("config", &["json"])
@@ -741,9 +727,11 @@ impl DavpApp {
 
                 let old_storage_dir = self.storage_dir.clone();
 
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.label("Data storage directory");
-                    ui.text_edit_singleline(&mut self.storage_dir);
+
+                    let w = (ui.available_width() * 0.55).clamp(160.0, 520.0);
+                    ui.add(egui::TextEdit::singleline(&mut self.storage_dir).desired_width(w));
 
                     if ui.button("Browse").clicked() {
                         if let Some(folder) = rfd::FileDialog::new().pick_folder() {
@@ -759,7 +747,7 @@ impl DavpApp {
                 ui.add_space(2.0);
                 ui.heading("Certificates / CNT Tracker");
 
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     let cert_sources = self.all_certs_sources();
                     let mut cert_idx = cert_sources
                         .iter()
@@ -773,6 +761,8 @@ impl DavpApp {
                             }
                         });
                     self.certs_url = cert_sources[cert_idx].1.clone();
+
+                    ui.separator();
 
                     let trackers = self.all_cnt_trackers();
                     let mut tracker_idx = trackers
@@ -796,6 +786,9 @@ impl DavpApp {
                         self.cnt_server = self.cnt_selected_addr.clone();
                         self.autosave_app_config();
                     }
+                });
+
+                ui.horizontal_wrapped(|ui| {
                     if ui.button("Refresh certs").clicked() {
                         let _ = self.fetch_certs_bundle_for_verify(true);
                     }
@@ -810,10 +803,9 @@ impl DavpApp {
 
     fn ui_keygen(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
-            ui.heading("Keygen");
 
             egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.heading("Keygenerator");
+                ui.heading("Keygen");
                 ui.label("Generate a signing keypair. Store the keypair securely; it can create proofs.");
 
                 ui.add_space(6.0);
@@ -1020,6 +1012,11 @@ impl DavpApp {
             }
             let _ = self.rt.block_on(node_handle);
         }
+
+        if let Some(h) = self.upnp_handle.take() {
+            h.abort();
+            let _ = self.rt.block_on(h);
+        }
         self.networking_started = false;
         self.networking_started_at = None;
         self.tasks_started = false;
@@ -1054,6 +1051,7 @@ impl DavpApp {
 
     fn ui_network_bar(&mut self, ui: &mut egui::Ui) {
         egui::Frame::group(ui.style()).show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
             ui.vertical(|ui| {
                 ui.horizontal(|ui| {
                     if !self.networking_started {
@@ -1076,11 +1074,44 @@ impl DavpApp {
                         let peers_arc = Arc::clone(&self.peers_arc);
                         self.rt.block_on(async move { peers_arc.read().await.len() })
                     };
-                    ui.label(format!("Peers: {}/{}", connected, known));
+                    ui.label(format!("Peers: {} out of {}", connected, known));
                 });
 
-                ui.add_space(4.0);
-            
+                {
+                    let status = self
+                        .cnt_ui_status
+                        .lock()
+                        .map(|s| s.clone())
+                        .unwrap_or_default();
+
+                    let ok_part = status
+                        .last_ok
+                        .map(|t| format!(
+                            "ok {}ms ago",
+                            Instant::now().duration_since(t).as_millis()
+                        ))
+                        .unwrap_or_else(|| "ok never".to_string());
+
+                    ui.add(
+                        egui::Label::new(format!(
+                            "CNT: {} entries | {} | {}",
+                            status.last_entry_count,
+                            if status.requester_stable {
+                                "Stable"
+                            } else {
+                                "Non-stable"
+                            },
+                            ok_part
+                        ))
+                        .wrap(true),
+                    );
+
+                    if let Some(e) = status.last_error {
+                        if !e.trim().is_empty() {
+                            ui.add(egui::Label::new(format!("CNT error: {}", e)).wrap(true));
+                        }
+                    }
+                }
 
                 if self.networking_started {
                     let uptime = self
@@ -1098,44 +1129,16 @@ impl DavpApp {
 
                     let observed_ip = self.observed_public_ip.lock().ok().and_then(|g| *g);
 
-                    let bind: Option<SocketAddr> = self.node_bind.parse().ok();
-                    let cnt_uptime_seconds: Option<i64> = bind.and_then(|b| {
-                        self.bootstrap_entries
-                            .lock()
-                            .ok()
-                            .and_then(|g| g.iter().find(|e| e.addr == b).map(|e| e.uptime_seconds))
-                    });
-
-                    egui::Grid::new("network_bar_kv").num_columns(2).show(ui, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(": : ");
                         ui.label("Uptime");
                         ui.label(format!("{}s", uptime));
-                        ui.end_row();
-
+                        ui.separator();
                         ui.label("Listen");
                         ui.add(egui::Label::new(self.node_bind.trim()).wrap(true));
-                        ui.end_row();
-
-                        ui.label("UPnP");
-                        ui.add(egui::Label::new(upnp_line).wrap(true));
-                        ui.end_row();
-
-                        ui.label("Public IP");
-                        ui.label(
-                            observed_ip
-                                .map(|ip| ip.to_string())
-                                .unwrap_or_else(|| "-".to_string()),
-                        );
-                        ui.end_row();
-
-                        ui.label("CNT uptime");
-                        ui.label(
-                            cnt_uptime_seconds
-                                .map(|s| format!("{}s", s))
-                                .unwrap_or_else(|| "-".to_string()),
-                        );
-                        ui.end_row();
                     });
 
+                    
                     let upstream_ip = observed_ip.or_else(|| self.upnp_external_ip.lock().ok().and_then(|g| *g));
                     if let Some(ip) = upstream_ip {
                         if is_unroutable_ip(ip) {
@@ -1145,53 +1148,13 @@ impl DavpApp {
                             );
                         }
                     }
-                }
-
-                {
-                    let status = self
-                        .cnt_ui_status
-                        .lock()
-                        .map(|s| s.clone())
-                        .unwrap_or_default();
-                    let mut line = format!(
-                        "CNT: entries={} stable={} ",
-                        status.last_entry_count,
-                        if status.requester_stable { "yes" } else { "no" }
-                    );
-                    if let Some(t) = status.last_ok {
-                        let ago_ms = Instant::now().duration_since(t).as_millis();
-                        line.push_str(&format!("last_ok={}ms_ago", ago_ms));
-                    } else {
-                        line.push_str("last_ok=never");
-                    }
-                    if let Some(e) = status.last_error {
-                        line.push_str(" last_error=");
-                        line.push_str(&e);
-                    }
-                    ui.label(line);
-                }
-
-                ui.add_space(6.0);
-
+                }   
+                
                 egui::Grid::new("network_bar_grid")
                     .num_columns(2)
                     .spacing(egui::vec2(12.0, 6.0))
                     .show(ui, |ui| {
-                        ui.label("Max peers");
-                        ui.add_enabled_ui(!self.networking_started, |ui| {
-                            ui.horizontal(|ui| {
-                                let mut v = self.max_peers;
-                                let resp = ui.add(
-                                    egui::DragValue::new(&mut v).clamp_range(50..=usize::MAX),
-                                );
-                                if ui.is_enabled() && resp.changed() {
-                                    self.max_peers = v;
-                                    self.autosave_app_config();
-                                }
-                            });
-                        });
-                        ui.end_row();
-
+                    
                         ui.label("UPnP");
                         ui.add_enabled_ui(!self.networking_started, |ui| {
                             let before = self.upnp_enabled;
@@ -1213,40 +1176,94 @@ impl DavpApp {
                             ui.label(ip.to_string());
                         });
                         ui.end_row();
+                        
 
                         ui.label("Node port");
                         ui.add_enabled_ui(!self.networking_started, |ui| {
+                            let mut v = self.node_port as u32;
                             let resp = ui.add(
-                                egui::TextEdit::singleline(&mut self.node_port_text)
-                                    .desired_width(80.0)
-                                    .char_limit(4),
+                                egui::DragValue::new(&mut v)
+                                    .clamp_range(1..=99999u32)
+                                    .speed(1),
                             );
                             if ui.is_enabled() && resp.changed() {
-                                if self.node_port_text.trim() == "*" {
-                                    self.node_port = 9001;
-                                    self.recompute_network_addrs();
-                                    self.autosave_app_config();
-                                } else {
-                                    self.normalize_node_port_text();
-                                    self.autosave_app_config();
-                                }
+                                let v = v.min(u16::MAX as u32);
+                                self.node_port = v as u16;
+                                self.node_port_text = self.node_port.to_string();
+                                self.recompute_network_addrs();
+                                self.autosave_app_config();
                             }
                         });
+
+                        
                         ui.end_row();
 
-
-                        ui.label("Seed peers");
+                        ui.label("Max peers");
                         ui.add_enabled_ui(!self.networking_started, |ui| {
                             ui.horizontal(|ui| {
-                                let resp = ui.add(egui::TextEdit::singleline(&mut self.peers).desired_width(420.0));
-                                if resp.changed() {
-                                    self.apply_seed_peers();
+                                let mut v = self.max_peers;
+                                let resp = ui.add(
+                                    egui::DragValue::new(&mut v).clamp_range(50..=usize::MAX),
+                                );
+                                if ui.is_enabled() && resp.changed() {
+                                    self.max_peers = v;
+                                    self.autosave_app_config();
                                 }
                             });
                         });
                         ui.end_row();
 
-                        ui.label("CNT");
+
+                        ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                            ui.label("Seed peers");
+                        });
+                        ui.add_enabled_ui(!self.networking_started, |ui| {
+                            ui.vertical(|ui| {
+                                ui.horizontal(|ui| {
+                                    let mut changed = false;
+                                    if self.seed_peers_bulk_edit {
+                                        let resp = ui.add(
+                                            egui::TextEdit::multiline(&mut self.peers)
+                                                .desired_rows(5)
+                                                .desired_width(420.0),
+                                        );
+                                        if resp.changed() {
+                                            changed = true;
+                                        }
+                                        ui.vertical(|ui| {
+                                            if ui.button("Bulk edit").clicked() {
+                                                self.seed_peers_bulk_edit = false;
+                                            }
+                                        });
+                                    } else {
+                                        let resp = ui.add(
+                                            egui::TextEdit::singleline(&mut self.peers)
+                                                .desired_width(420.0),
+                                        );
+                                        if resp.changed() {
+                                            changed = true;
+                                        }
+                                        if ui.button("Bulk edit").clicked() {
+                                            self.seed_peers_bulk_edit = true;
+                                        }
+                                    }
+
+                                    if changed {
+                                        self.apply_seed_peers();
+                                    }
+                                });
+                            });
+                        });
+                        ui.end_row();
+
+                        ui.label("");
+                        ui.colored_label(
+                            egui::Color32::from_gray(140),
+                            "Example: 127.0.0.1:9001, cnt.example.com",
+                        );
+                        ui.end_row();
+
+                        ui.label("CNT Server");
                         ui.horizontal(|ui| {
                             ui.add_enabled_ui(!self.networking_started, |ui| {
                                 let before = self.cnt_enabled;
@@ -1276,12 +1293,13 @@ impl DavpApp {
                                         for (i, (name, _)) in trackers.iter().enumerate() {
                                             ui.selectable_value(&mut selected, i, name);
                                         }
+
                                     });
 
                                 let new_addr = trackers
                                     .get(selected)
                                     .map(|(_, addr)| addr.clone())
-                                    .unwrap_or_else(|| "cnt.unitedorigins.com:5157".to_string());
+                                    .unwrap_or_else(|| DEFAULT_CNT_TRACKER_ADDR.to_string());
                                 if new_addr.trim() != self.cnt_selected_addr.trim() {
                                     self.cnt_selected_addr = new_addr;
                                     self.cnt_server = self.cnt_selected_addr.clone();
@@ -1290,6 +1308,7 @@ impl DavpApp {
                             });
                         });
                         ui.end_row();
+
                     });
 
                 ui.add_space(6.0);
@@ -1518,8 +1537,9 @@ impl DavpApp {
         if upnp_enabled {
             let advertise_addr = Arc::clone(&advertise_addr);
             let upnp_mapped_addr_upnp = Arc::clone(&upnp_mapped_addr);
-            self.rt.spawn(async move {
-                if let Ok(mut g) = upnp_status_line.lock() {
+            let upnp_status_line_upnp = Arc::clone(&upnp_status_line);
+            let upnp_handle = self.rt.spawn(async move {
+                if let Ok(mut g) = upnp_status_line_upnp.lock() {
                     *g = "UPnP: searching gateway...".to_string();
                 }
 
@@ -1530,7 +1550,7 @@ impl DavpApp {
                 let gw = match igd_tokio::search_gateway(opts).await {
                     Ok(v) => v,
                     Err(e) => {
-                        if let Ok(mut g) = upnp_status_line.lock() {
+                        if let Ok(mut g) = upnp_status_line_upnp.lock() {
                             *g = format!("UPnP: unavailable ({})", e);
                         }
                         return;
@@ -1545,7 +1565,7 @@ impl DavpApp {
                         Some(v)
                     }
                     Err(e) => {
-                        if let Ok(mut g) = upnp_status_line.lock() {
+                        if let Ok(mut g) = upnp_status_line_upnp.lock() {
                             *g = format!(
                                 "UPnP: gateway found, external IP unavailable ({})",
                                 e
@@ -1594,14 +1614,14 @@ impl DavpApp {
                             *g = mapped;
                         }
                     }
-                    if let Ok(mut g) = upnp_status_line.lock() {
+                    if let Ok(mut g) = upnp_status_line_upnp.lock() {
                         *g = format!("UPnP: mapped {} -> {}", mapped, local_addr);
                     }
                     return;
                 }
 
                 if let Some(p) = mapped_port {
-                    if let Ok(mut g) = upnp_status_line.lock() {
+                    if let Ok(mut g) = upnp_status_line_upnp.lock() {
                         *g = format!(
                             "UPnP: mapped external port {} -> {} (external IP unknown)",
                             p, local_addr
@@ -1610,13 +1630,15 @@ impl DavpApp {
                     return;
                 }
 
-                if let Ok(mut g) = upnp_status_line.lock() {
+                if let Ok(mut g) = upnp_status_line_upnp.lock() {
                     *g = match ext_ip {
                         Some(ip) => format!("UPnP: gateway external IP {} (no mapping)", ip),
                         None => "UPnP: gateway found (no mapping)".to_string(),
                     };
                 }
             });
+
+            self.upnp_handle = Some(upnp_handle);
         }
 
         // Start libp2p overlay network (gossipsub hub). This enables proof propagation even
@@ -1743,6 +1765,7 @@ let dial_cursor = Arc::new(AtomicUsize::new(0));
                                 peer_graph: Arc::clone(&peer_graph_cnt),
                                 upnp_enabled,
                                 upnp_mapped_addr: Arc::clone(&upnp_mapped_addr),
+                                upnp_status_line: Arc::clone(&upnp_status_line),
                                 cnt_server,
                                 bootstrap_entries: Arc::clone(&bootstrap_entries_cnt),
                                 cnt_ui_status: Arc::clone(&cnt_ui_status_cnt),
@@ -1762,6 +1785,7 @@ let dial_cursor = Arc::new(AtomicUsize::new(0));
                             peer_graph: Arc::clone(&peer_graph_cnt),
                             upnp_enabled,
                             upnp_mapped_addr: Arc::clone(&upnp_mapped_addr),
+                            upnp_status_line: Arc::clone(&upnp_status_line),
                             cnt_server,
                             bootstrap_entries: Arc::clone(&bootstrap_entries_cnt),
                             cnt_ui_status: Arc::clone(&cnt_ui_status_cnt),
@@ -2077,7 +2101,7 @@ let dial_cursor = Arc::new(AtomicUsize::new(0));
 
                                     ui.label("Asset type:");
                                     if self.create_asset_type.is_empty() {
-                                        self.create_asset_type = "other".to_string();
+                                        self.create_asset_type = DEFAULT_CREATE_ASSET_TYPE.to_string();
                                     }
                                     ui.horizontal(|ui| {
                                         egui::ComboBox::from_id_source("asset_type")
@@ -2669,6 +2693,7 @@ struct CntReportCtx {
     peer_graph: Arc<RwLock<HashMap<SocketAddr, Vec<SocketAddr>>>>,
     upnp_enabled: bool,
     upnp_mapped_addr: Arc<Mutex<Option<SocketAddr>>>,
+    upnp_status_line: Arc<Mutex<String>>,
     cnt_server: SocketAddr,
     bootstrap_entries: Arc<Mutex<Vec<PeerEntry>>>,
     cnt_ui_status: Arc<Mutex<CntUiStatus>>,
@@ -3039,15 +3064,6 @@ async fn cnt_report_once(ctx: CntReportCtx) -> anyhow::Result<()> {
         }
     };
 
-    if !is_local_cnt && is_unroutable_ip(reported_addr.ip()) {
-        if let Ok(mut s) = ctx.cnt_ui_status.lock() {
-            s.last_error = Some(
-                "CNT warning: reporting may be rejected (no routable public address; check UPnP/port-forward)"
-                    .to_string(),
-            );
-        }
-    }
-
     let stable_hint = ctx
         .cnt_ui_status
         .lock()
@@ -3064,13 +3080,23 @@ async fn cnt_report_once(ctx: CntReportCtx) -> anyhow::Result<()> {
         Vec::new()
     };
 
-    let upnp_enabled = ctx.upnp_enabled
-        && ctx
+    let upnp_enabled = if !ctx.upnp_enabled {
+        false
+    } else {
+        let has_mapping = ctx
             .upnp_mapped_addr
             .lock()
             .ok()
             .and_then(|g| *g)
             .is_some();
+        let status_mapped = ctx
+            .upnp_status_line
+            .lock()
+            .ok()
+            .map(|g| g.to_ascii_lowercase().contains("mapped"))
+            .unwrap_or(false);
+        has_mapping || status_mapped
+    };
 
     let report = if send_gossip {
         PeerReport {
@@ -3210,62 +3236,6 @@ fn detect_local_ip_to(remote: SocketAddr) -> Option<IpAddr> {
     Some(sock.local_addr().ok()?.ip())
 }
 
-fn is_unroutable_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            if v4.is_loopback() || v4.is_unspecified() {
-                return true;
-            }
-            let o = v4.octets();
-            // RFC1918 + link-local
-            (o[0] == 10)
-                || (o[0] == 172 && (16..=31).contains(&o[1]))
-                || (o[0] == 192 && o[1] == 168)
-                || (o[0] == 169 && o[1] == 254)
-                || (o[0] == 100 && (64..=127).contains(&o[1]))
-        }
-        IpAddr::V6(v6) => {
-            if v6.is_loopback() || v6.is_unspecified() {
-                return true;
-            }
-            let seg0 = v6.segments()[0];
-            // Unique local: fc00::/7
-            if (seg0 & 0xfe00) == 0xfc00 {
-                return true;
-            }
-            // Link-local unicast: fe80::/10
-            if (seg0 & 0xffc0) == 0xfe80 {
-                return true;
-            }
-            false
-        }
-    }
-}
-
-fn is_invalid_peer_addr(a: SocketAddr) -> bool {
-    is_invalid_peer_ip(a.ip()) || a.port() == 0
-}
-
-fn is_invalid_peer_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => v4.is_loopback() || v4.is_unspecified() || v4.is_multicast() || v4.is_link_local(),
-        IpAddr::V6(v6) => {
-            v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() || v6.is_unicast_link_local()
-        }
-    }
-}
-
-fn is_invalid_observed_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            v4.is_loopback() || v4.is_unspecified() || v4.is_multicast() || v4.is_link_local()
-        }
-        IpAddr::V6(v6) => {
-            v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() || v6.is_unicast_link_local()
-        }
-    }
-}
-
 fn parse_asset_type(s: &str) -> std::result::Result<AssetType, String> {
     match s.trim().to_ascii_lowercase().as_str() {
         "text" => Ok(AssetType::Text),
@@ -3279,7 +3249,9 @@ fn parse_asset_type(s: &str) -> std::result::Result<AssetType, String> {
 
 fn parse_peers(peers: &str) -> std::result::Result<Vec<SocketAddr>, String> {
     let mut out = Vec::new();
-    for part in peers.split(',') {
+    for part in peers
+        .split(|c: char| c == ',' || c.is_whitespace())
+    {
         let p = part.trim();
         if p.is_empty() {
             continue;

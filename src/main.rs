@@ -15,6 +15,7 @@ use davp::modules::network::{
 use davp::modules::storage::Storage;
 use davp::modules::verification::verify_proof;
 use davp::KeypairBytes;
+use davp::config::{DEFAULT_CREATE_ASSET_TYPE, DEFAULT_DATA_DIR};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -43,7 +44,7 @@ enum Commands {
         #[arg(long)]
         keypair_base64: String,
 
-        #[arg(long, default_value = "other")]
+        #[arg(long, default_value = DEFAULT_CREATE_ASSET_TYPE)]
         asset_type: String,
 
         #[arg(long, default_value_t = false)]
@@ -61,7 +62,7 @@ enum Commands {
         #[arg(long)]
         issuer_certificate_id: Option<String>,
 
-        #[arg(long, default_value = "davp_storage")]
+        #[arg(long, default_value = DEFAULT_DATA_DIR)]
         storage_dir: PathBuf,
 
         #[arg(long)]
@@ -93,7 +94,7 @@ enum Commands {
         #[arg(long, alias = "certs_json_base64")]
         certs_json_base64: Option<String>,
 
-        #[arg(long, default_value = "davp_storage")]
+        #[arg(long, default_value = DEFAULT_DATA_DIR)]
         storage_dir: PathBuf,
     },
 
@@ -104,7 +105,7 @@ enum Commands {
         #[arg(long)]
         public_ip: std::net::IpAddr,
 
-        #[arg(long, default_value = "davp_storage")]
+        #[arg(long, default_value = DEFAULT_DATA_DIR)]
         storage_dir: PathBuf,
 
         #[arg(long)]
