@@ -9,6 +9,7 @@ pub enum AssetType {
     Image,
     Video,
     Other,
+    Audio,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

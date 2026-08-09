@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -20,6 +20,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const TARGET_OUTBOUND_SESSIONS: usize = 8;
 const OUTBOUND_DIAL_TICK: Duration = Duration::from_secs(2);
+/// Upper bound on a single serialized protocol message. Proofs and gossip lists are
+/// small (tens of KB at most); the cap prevents a malicious peer from exhausting
+/// memory with a bogus length prefix.
+const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct NodeConfig {
@@ -244,7 +248,6 @@ pub async fn replicate_proof(proof: &Proof, peers: &[SocketAddr]) {
 pub async fn replicate_published_proof(published: &PublishedProof, peers: &[SocketAddr]) {
     for peer in peers {
         let _ = send_message(*peer, &Message::PushPublishedProof(published.clone())).await;
-        let _ = send_message(*peer, &Message::PushProof(published.proof.clone())).await;
     }
 }
 
@@ -814,6 +817,9 @@ async fn write_message<W: AsyncWriteExt + Unpin>(stream: &mut W, msg: &Message) 
 
 async fn read_message<R: AsyncReadExt + Unpin>(stream: &mut R) -> Result<Message> {
     let len = timeout(IO_TIMEOUT, stream.read_u32_le()).await?? as usize;
+    if len == 0 || len > MAX_MESSAGE_BYTES {
+        return Err(anyhow!("invalid message length: {}", len));
+    }
     let mut buf = vec![0u8; len];
     timeout(IO_TIMEOUT, stream.read_exact(&mut buf)).await??;
     Ok(bincode::deserialize::<Message>(&buf)?)

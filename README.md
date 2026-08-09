@@ -1,11 +1,21 @@
 > [!WARNING]
-> This is not feature-complete and its protocol, storage, and networking behavior may change without notice. Do not rely on it for production or long-term guarantees yet. Support state will indicated when the first release publishes.
+> This is not feature-complete and its protocol, storage, and networking behavior may change without notice. Do not rely on it for production or long-term guarantees yet. Support state will be indicated when the first stable release publishes.
 
 # DAVP
 
 Decentralized Asset Verification Protocol. DAVP is a program and protocol implementation for creating, storing, verifying, and replicating cryptographic proofs about arbitrary digital content (assets).
 
-> DAVP was created because there wasn’t a simple way to prove that a file or piece of content really came from someone at a certain time. Most systems rely on **central servers** or **authorities**, which can **go down**, **be hacked**, or **lie**. With DAVP, you can create a proof locally, sign it with your key, and anyone can check it later, or even offline. You can also share proofs with other peers or link them to known issuers, **without** the need for a blockchain or a central authority. 
+> DAVP was created because there wasn’t a simple way to prove that a file or piece of content really came from someone at a certain time. Most systems rely on **central servers** or **authorities**, which can **go down**, **be hacked**, or **lie**. With DAVP, you can create a proof locally, sign it with your key, and anyone can check it later, or even offline. You can also share proofs with other peers or link them to known issuers, **without** the need for a blockchain or a central authority.
+
+## What's new in 0.2.0
+
+- **`davp list`** – list the verification IDs stored in the local storage directory.
+- **`davp verify --peers <addr>,...`** – when a proof is not stored locally, fetch and verify it directly from peers over the P2P network.
+- **`davp --version`** – print the installed version.
+- **`audio` asset type** – the GUI/CLI `audio` option now works end-to-end (previously it errored at parse time).
+- **Networking hardening** – peer-to-peer and CNT messages are now length-capped, so a malicious peer cannot force a giant allocation.
+- **Performance** – files are hashed in a streaming fashion (bounded memory for multi-GB assets), and issuer-certificate fetches reuse a single HTTP client with connection pooling.
+- **Housekeeping** – removed duplicated/unused networking modules and aligned the CNT server's default bind port with the documented tracker address.
 
 
 ## Demonstration

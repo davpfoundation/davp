@@ -3242,6 +3242,7 @@ fn parse_asset_type(s: &str) -> std::result::Result<AssetType, String> {
         "code" => Ok(AssetType::Code),
         "image" => Ok(AssetType::Image),
         "video" => Ok(AssetType::Video),
+        "audio" => Ok(AssetType::Audio),
         "other" => Ok(AssetType::Other),
         _ => Err("unknown asset_type".to_string()),
     }

@@ -18,7 +18,7 @@ use tokio::sync::watch;
 #[derive(Parser, Debug)]
 #[command(name = "davp_bootstrap_server")]
 struct Cli {
-    #[arg(long, default_value = "0.0.0.0:9100")]
+    #[arg(long, default_value = "0.0.0.0:5157")]
     bind: SocketAddr,
 
     #[arg(long)]

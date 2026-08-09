@@ -10,7 +10,8 @@ use davp::modules::issuer_certificate::{
 };
 use davp::modules::metadata::{AssetType, Metadata};
 use davp::modules::network::{
-    ping_peer, replicate_proof, replicate_published_proof, run_node, NodeConfig, PeerConnections,
+    fetch_proof_from_peers, fetch_published_proof_from_peers, ping_peer, replicate_proof,
+    replicate_published_proof, run_node, NodeConfig, PeerConnections,
 };
 use davp::modules::storage::Storage;
 use davp::modules::verification::verify_proof;
@@ -23,7 +24,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 #[derive(Parser, Debug)]
-#[command(name = "davp")]
+#[command(name = "davp", version)]
 struct Cli {
     /// Launch the graphical user interface instead of the command-line interface
     #[arg(long)]
@@ -96,6 +97,15 @@ enum Commands {
 
         #[arg(long, default_value = DEFAULT_DATA_DIR)]
         storage_dir: PathBuf,
+
+        /// Peers to query when the proof is not in local storage
+        #[arg(long)]
+        peers: Option<Vec<SocketAddr>>,
+    },
+
+    List {
+        #[arg(long, default_value = DEFAULT_DATA_DIR)]
+        storage_dir: PathBuf,
     },
 
     Node {
@@ -139,6 +149,7 @@ fn parse_asset_type(s: &str) -> Result<AssetType> {
         "code" => Ok(AssetType::Code),
         "image" => Ok(AssetType::Image),
         "video" => Ok(AssetType::Video),
+        "audio" => Ok(AssetType::Audio),
         "other" => Ok(AssetType::Other),
         _ => Err(anyhow!("unknown asset_type")),
     }
@@ -230,13 +241,42 @@ async fn cli_main(cli: Cli) -> Result<()> {
             certs_json,
             certs_json_base64,
             storage_dir,
+            peers,
         } => {
             let storage = Storage::new(storage_dir);
-            let published = storage.retrieve_published_proof(&verification_id)?;
 
             let content = match file {
                 Some(path) => Some(std::fs::read(path)?),
                 None => None,
+            };
+
+            let published = match storage.retrieve_published_proof(&verification_id) {
+                Ok(p) => p,
+                Err(_) => match peers {
+                    Some(peer_list) => {
+                        if let Some(p) =
+                            fetch_published_proof_from_peers(&peer_list, &verification_id).await?
+                        {
+                            verify_proof(&p.proof, content.as_deref())?;
+                            storage.store_published_proof(&p)?;
+                            p
+                        } else if let Some(p) =
+                            fetch_proof_from_peers(&peer_list, &verification_id).await?
+                        {
+                            verify_proof(&p, content.as_deref())?;
+                            storage.store_proof(&p)?;
+                            PublishedProof {
+                                proof: p,
+                                issuer_certificate_id: None,
+                            }
+                        } else {
+                            return Err(anyhow!(
+                                "not found in storage or on any of the given peers"
+                            ));
+                        }
+                    }
+                    None => return Err(anyhow!("verification_id not found in storage")),
+                },
             };
 
             verify_proof(&published.proof, content.as_deref())?;
@@ -508,6 +548,18 @@ async fn cli_main(cli: Cli) -> Result<()> {
                 }
                 None => {
                     println!("unverified issuer");
+                }
+            }
+            Ok(())
+        }
+        Commands::List { storage_dir } => {
+            let storage = Storage::new(storage_dir);
+            let ids = storage.list_verification_ids()?;
+            if ids.is_empty() {
+                println!("no proofs stored");
+            } else {
+                for id in ids {
+                    println!("{}", id);
                 }
             }
             Ok(())

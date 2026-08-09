@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -7,6 +7,9 @@ use tokio::net::TcpStream;
 use tokio::time::{timeout, Duration};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(2);
+/// The CNT server enforces a 64 KB cap on messages it accepts; mirror that here so a
+/// misbehaving server cannot trigger a large allocation.
+const MAX_MESSAGE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerReport {
@@ -66,6 +69,9 @@ async fn write_message(stream: &mut TcpStream, msg: &Message) -> Result<()> {
 
 async fn read_message(stream: &mut TcpStream) -> Result<Message> {
     let len = timeout(IO_TIMEOUT, stream.read_u32_le()).await?? as usize;
+    if len == 0 || len > MAX_MESSAGE_BYTES {
+        return Err(anyhow!("invalid message length: {}", len));
+    }
     let mut buf = vec![0u8; len];
     timeout(IO_TIMEOUT, stream.read_exact(&mut buf)).await??;
     Ok(bincode::deserialize::<Message>(&buf)?)

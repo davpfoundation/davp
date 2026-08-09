@@ -3,8 +3,23 @@ use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
+use std::time::Duration;
 
 pub use crate::config::DEFAULT_CERTS_URL;
+
+/// Reuse a single HTTP client (connection pooling, shared TLS state) instead of
+/// building a new one per request.
+static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn http_client() -> Result<&'static reqwest::Client> {
+    HTTP_CLIENT.get_or_try_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .map_err(|e| anyhow!(e))
+    })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IssuerCertificateBundle {
@@ -173,9 +188,7 @@ fn verify_validity_window(cert: &IssuerCertificate, now: DateTime<Utc>) -> Resul
 }
 
 pub async fn fetch_certificates(url: &str) -> Result<Vec<IssuerCertificate>> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()?;
+    let client = http_client()?;
 
     let resp = client
         .get(url)
@@ -194,9 +207,7 @@ pub fn parse_certificates_json(json: &str) -> Result<Vec<IssuerCertificate>> {
 }
 
 pub async fn fetch_certificate_bundle(url: &str) -> Result<IssuerCertificateBundle> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()?;
+    let client = http_client()?;
 
     let resp = client
         .get(url)

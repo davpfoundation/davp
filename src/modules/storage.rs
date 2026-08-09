@@ -94,6 +94,31 @@ impl Storage {
         Ok(index.entries.get(asset_hash).cloned().unwrap_or_default())
     }
 
+    pub fn list_verification_ids(&self) -> Result<Vec<String>> {
+        if !self.base_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut ids = Vec::new();
+        for entry in fs::read_dir(&self.base_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if let Some(stripped) = name.strip_suffix(".bin") {
+                if !stripped.ends_with(".meta") && stripped != "hash_index" {
+                    ids.push(stripped.to_string());
+                }
+            }
+        }
+        ids.sort();
+        Ok(ids)
+    }
+
     fn proof_path(&self, verification_id: &str) -> PathBuf {
         self.base_dir.join(format!("{}.bin", verification_id))
     }
